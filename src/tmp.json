@@ -1,9 +1,0 @@
-{
-    "m.homeserver": {
-        "base_url": "tjet.nl"
-    },
-    "org.matrix.msc2965.authentication": {
-        "issuer": "https://account.tjet.nl/",
-        "account": "https://account.tjet.nl/account/"
-    }
-}

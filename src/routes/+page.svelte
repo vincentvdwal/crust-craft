@@ -16,25 +16,28 @@
 
 	const now = new Date();
 
-	let mode = 'off';
-	let temp = 300;
-	let relais = 0;
-	let targetTemp = 300;
+	let mode = $state('off');
+	let temp = $state(300);
+	let relais = $state(0);
+	let targetTemp = $state(300);
 	let setOverShoot = 20;
 	let setUnderShoot = 20;
-	let targetTempOverShoot = targetTemp;
-	let targetTempUnderShoot = targetTemp;
+	let targetTempOverShoot = $state(targetTemp);
+	let targetTempUnderShoot = $state(targetTemp);
+	let calculatedPidOutput = $state(0);
 
 	let lastSwitch = new Date();
 	let lastSwitchDuration = 0;
 
 	let canvas: HTMLCanvasElement;
 
-	let pauseGraphUpdate = false;
+	let pauseGraphUpdate = $state(false);
 	let spoofInterval = 250;
 	let speedFactor = 250 / spoofInterval;
 	const switchDelay = (30 / speedFactor) * 1000;
+	let pwmOn = $state(4);
 	let pwmOnDelay = (4 / speedFactor) * 1000;
+	let pwmOff = $state(7);
 	let pwmOffDelay = (7 / speedFactor) * 1000;
 
 	let maxValues = 4 * 2 * 60 * 60; // 120 minutes (4 values/sec)
@@ -352,6 +355,12 @@
 				targetTempOverShoot = myObj[key];
 			} else if (key === 'derived_undershoot') {
 				targetTempUnderShoot = myObj[key];
+			} else if (key === 'pid') {
+				calculatedPidOutput = myObj[key];
+			} else if (key === 'pwm_on') {
+				pwmOn = Number(myObj[key]) / 1000;
+			} else if (key === 'pwm_off') {
+				pwmOff = Number(myObj[key]) / 1000;
 			} else if (key === 'mode') {
 				mode = myObj[key];
 				modeSpan.innerText = mode;
@@ -402,6 +411,7 @@
 		const target = e.target as HTMLTextAreaElement;
 		let value = Number(target?.value);
 		console.log('Changed pwm on to ' + value);
+		pwmOn = value;
 		if (!import.meta.env.DEV) {
 			ws.send('setPWMOn: ' + pad(value, 3));
 		} else {
@@ -413,6 +423,7 @@
 		const target = e.target as HTMLTextAreaElement;
 		let value = Number(target?.value);
 		console.log('Changed pwm off to ' + value);
+		pwmOff = value;
 		if (!import.meta.env.DEV) {
 			ws.send('setPWMOff: ' + pad(value, 3));
 		} else {
@@ -486,7 +497,7 @@
 	<div class="graph">
 		<div class="plot-wrapper w-[800px]">
 			<div id="plot"></div>
-			<canvas bind:this={canvas} id="acquisitions"></canvas>
+			<canvas bind:this={canvas} id="crusty"></canvas>
 		</div>
 	</div>
 	<div class="card-grid settings">
@@ -498,7 +509,7 @@
 					type="number"
 					min="0"
 					max="600"
-					placeholder="300"
+					value={targetTemp}
 					id="target_temperature"
 					onchange={changeTargetTemp}
 				/>
@@ -513,11 +524,12 @@
 				<select class="rounded" name="modes" id="mode_selector" onchange={changeMode}>
 					<option value="auto_switch">Auto Switch</option>
 					<option value="pwm">PWM</option>
+					<option value="pid">PID</option>
 					<option value="off" selected>Manual</option>
 				</select>
 			</p>
 			{#if mode === 'pwm'}
-				<div class="gap-15 mt-2 flex items-center">
+				<div class="mt-2 flex items-center gap-15">
 					<div>on</div>
 					<div>off</div>
 				</div>
@@ -528,7 +540,7 @@
 						type="number"
 						min="0"
 						max="120"
-						placeholder="4"
+						bind:value={pwmOn}
 						id="pwm_on"
 						onchange={changePwmOn}
 					/>
@@ -538,12 +550,24 @@
 						type="number"
 						min="0"
 						max="120"
-						placeholder="7"
+						bind:value={pwmOff}
 						id="pwm_off"
 						onchange={changePwmOff}
 					/>
 					<label for="pwm_off"> s </label>
 				</div>
+				<div class="mt-3 flex items-center gap-1">
+					{((pwmOn / (pwmOn + pwmOff)) * 100).toFixed(0)}%, {(
+						(pwmOn / (pwmOn + pwmOff)) *
+						1200
+					).toFixed(0)}W
+				</div>
+			{/if}
+			{#if mode === 'pid'}
+				<div class="mt-3 flex items-center gap-1">
+					PID: {calculatedPidOutput.toFixed(0)}% {(calculatedPidOutput * 12).toFixed(0)}W
+				</div>
+				<div>ON:{pwmOn.toFixed(2)}s OFF:{pwmOff.toFixed(2)}s</div>
 			{/if}
 		</div>
 		<div class="card flex cursor-pointer gap-2">

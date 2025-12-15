@@ -8,6 +8,7 @@
 #include <ElegantOTA.h>
 
 #include "secrets.h"
+#include "pid.h"
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -18,7 +19,7 @@ String jsonString;
 
 // Timer variables
 unsigned long lastTime = 0;
-unsigned long timerDelay = 250;
+unsigned long timerDelay = 500;
 
 int relay = 21;
 int thermoDO = 19;
@@ -37,8 +38,11 @@ unsigned long lastSwitch = 0;
 unsigned long autoSwitchDelay = 20000; // 20s
 float pwmSwitchDelayOn = 4000;         // 4s
 float pwmSwitchDelayOff = 7000;        // 7s
+float power = 0;
 
 String mode = "off";
+
+PIDController pid(1.0, 0.5, 1.0, 100.0, 0.0, 50.0); // Kp, Ki, Kd, max, min, integ_max
 
 // Get Sensor Readings and return JSON object
 String getSensorReadings()
@@ -60,6 +64,9 @@ String getSensorReadings()
   readings["derived_overshoot"] = derivedOverShoot;
   readings["derived_undershoot"] = derivedUnderShoot;
   readings["mode"] = mode;
+  readings["pid"] = power;
+  readings["pwm_on"] = pwmSwitchDelayOn;
+  readings["pwm_off"] = pwmSwitchDelayOff;
 
   serializeJson(readings, jsonString);
   return jsonString;
@@ -133,6 +140,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
     {
       String target = message.substring(15, 18);
       targetTemp = target.toFloat();
+      pid.setSetpoint(targetTemp);
       Serial.printf("\nTarget temp set to ");
       Serial.print(targetTemp);
       Serial.printf("°C");
@@ -146,6 +154,10 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
       else if (message.indexOf("pwm") > 0)
       {
         mode = "pwm";
+      }
+      else if (message.indexOf("pid") > 0)
+      {
+        mode = "pid";
       }
       else
       {
@@ -265,6 +277,37 @@ void regulateRelais()
       }
     }
   }
+  if (mode == "pid")
+  {
+    // output = Kp×error + Ki×∫error×dt + Kd×(Δerror/Δt)`[^2][^5]
+    power = pid.compute(temperature);
+    pwmSwitchDelayOff = (pwmSwitchDelayOn / (power / 100)) - pwmSwitchDelayOn;
+
+    if (pwmSwitchDelayOff > 0)
+    {
+      if ((millis() - lastSwitch) > pwmSwitchDelayOn)
+      {
+        if (digitalRead(relay) == HIGH)
+        {
+          digitalWrite(relay, LOW);
+          lastSwitch = millis();
+        }
+      }
+    }
+
+    if (pwmSwitchDelayOff > 0)
+    {
+
+      if ((millis() - lastSwitch) > pwmSwitchDelayOff)
+      {
+        if (digitalRead(relay) == LOW)
+        {
+          digitalWrite(relay, HIGH);
+          lastSwitch = millis();
+        }
+      }
+    }
+  }
 }
 
 void setup()
@@ -281,6 +324,10 @@ void setup()
             { request->send(LittleFS, "/index.html", "text/html"); });
 
   server.serveStatic("/", LittleFS, "/");
+
+  // Create PID controller instance
+  pid.setSetpoint(targetTemp);
+  pid.setDt(4);
 
   ElegantOTA.begin(&server);
 

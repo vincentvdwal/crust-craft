@@ -35,10 +35,14 @@
 	let spoofInterval = 250;
 	let speedFactor = 250 / spoofInterval;
 	const switchDelay = (30 / speedFactor) * 1000;
-	let pwmOn = $state(4);
-	let pwmOnDelay = (4 / speedFactor) * 1000;
-	let pwmOff = $state(7);
-	let pwmOffDelay = (7 / speedFactor) * 1000;
+	let pwmOn = $state(2);
+	let pwmOnDelay = (2 / speedFactor) * 1000;
+	let pwmOff = $state(4);
+	let pwmOffDelay = (4 / speedFactor) * 1000;
+
+	let kp = $state(0.25);
+	let ki = $state(0.25);
+	let kd = $state(0.25);
 
 	let maxValues = 4 * 2 * 60 * 60; // 120 minutes (4 values/sec)
 
@@ -361,6 +365,12 @@
 				pwmOn = Number(myObj[key]) / 1000;
 			} else if (key === 'pwm_off') {
 				pwmOff = Number(myObj[key]) / 1000;
+			} else if (key === 'kp') {
+				kp = Number(myObj[key]);
+			} else if (key === 'ki') {
+				ki = Number(myObj[key]);
+			} else if (key === 'kd') {
+				kd = Number(myObj[key]);
 			} else if (key === 'mode') {
 				mode = myObj[key];
 				modeSpan.innerText = mode;
@@ -440,6 +450,16 @@
 		} else {
 			mode = value;
 			modeSpan.innerText = value;
+		}
+	};
+
+	const changeKValue = (e: Event, k: string) => {
+		const target = e.target as HTMLTextAreaElement;
+		let value = target?.value;
+		console.log('K' + k + ': ' + value);
+		if (!import.meta.env.DEV) {
+			ws.send(`setK${k}: ` + value);
+		} else {
 		}
 	};
 
@@ -568,6 +588,43 @@
 					PID: {calculatedPidOutput.toFixed(0)}% {(calculatedPidOutput * 12).toFixed(0)}W
 				</div>
 				<div>ON:{pwmOn.toFixed(2)}s OFF:{pwmOff.toFixed(2)}s</div>
+				<div class="mt-3 flex w-full justify-between px-9">
+					<div>Kp</div>
+					<div>Ki</div>
+					<div>Kd</div>
+				</div>
+				<div class="flex gap-1">
+					<input
+						class="min-w-[85px] rounded"
+						type="number"
+						min="0"
+						max="50"
+						step="0.1"
+						value={kp}
+						id="target_temperature"
+						onchange={(e) => changeKValue(e, 'p')}
+					/>
+					<input
+						class="min-w-[85px] rounded"
+						type="number"
+						min="0"
+						max="50"
+						step="0.1"
+						value={ki}
+						id="target_temperature"
+						onchange={(e) => changeKValue(e, 'i')}
+					/>
+					<input
+						class="min-w-[85px] rounded"
+						type="number"
+						min="0"
+						max="50"
+						step="0.1"
+						value={kd}
+						id="target_temperature"
+						onchange={(e) => changeKValue(e, 'd')}
+					/>
+				</div>
 			{/if}
 		</div>
 		<div class="card flex cursor-pointer gap-2">

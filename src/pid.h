@@ -17,6 +17,10 @@ public:
                   double integ_max = 50.0);
 
     void setSetpoint(double sp);
+    void setSetKp(double nkp);
+    void setSetKi(double nki);
+    void setSetKd(double nkd);
+
     void setDt(double sample_time);
     double compute(double current_temp);
     void reset();

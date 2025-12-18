@@ -36,13 +36,17 @@ float derivedOverShoot = targetTemp;
 float derivedUnderShoot = targetTemp;
 unsigned long lastSwitch = 0;
 unsigned long autoSwitchDelay = 20000; // 20s
-float pwmSwitchDelayOn = 4000;         // 4s
-float pwmSwitchDelayOff = 7000;        // 7s
+float pwmSwitchDelayOn = 2000;         // 4s
+float pwmSwitchDelayOff = 4000;        // 7s
 float power = 0;
+
+float kp = 0.25;
+float ki = 0.25;
+float kd = 0.25;
 
 String mode = "off";
 
-PIDController pid(1.0, 0.5, 1.0, 100.0, 0.0, 50.0); // Kp, Ki, Kd, max, min, integ_max
+PIDController pid(kp, ki, kd, 100.0, 0.0, 50.0); // Kp, Ki, Kd, max, min, integ_max
 
 // Get Sensor Readings and return JSON object
 String getSensorReadings()
@@ -67,6 +71,10 @@ String getSensorReadings()
   readings["pid"] = power;
   readings["pwm_on"] = pwmSwitchDelayOn;
   readings["pwm_off"] = pwmSwitchDelayOff;
+
+  readings["kp"] = kp;
+  readings["ki"] = ki;
+  readings["kd"] = kd;
 
   serializeJson(readings, jsonString);
   return jsonString;
@@ -167,6 +175,24 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
       }
       Serial.printf("\nMode set to ");
       Serial.print(mode);
+    }
+    if (message.startsWith("setKp"))
+    {
+      String k = message.substring(6, 12);
+      kp = k.toFloat();
+      // pid.setSetKp(0.3);
+    }
+    if (message.startsWith("setKi"))
+    {
+      String k = message.substring(6, 12);
+      ki = k.toFloat();
+      // pid.setSetKp(0.3);
+    }
+    if (message.startsWith("setKd"))
+    {
+      String k = message.substring(6, 12);
+      kd = k.toFloat();
+      // pid.setSetKp(0.3);
     }
     if (message.startsWith("setPWMOn"))
     {
@@ -327,7 +353,7 @@ void setup()
 
   // Create PID controller instance
   pid.setSetpoint(targetTemp);
-  pid.setDt(4);
+  pid.setDt(2);
 
   ElegantOTA.begin(&server);
 

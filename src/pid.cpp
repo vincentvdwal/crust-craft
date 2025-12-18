@@ -20,6 +20,21 @@ void PIDController::setSetpoint(double sp)
     setpoint = sp;
 }
 
+void PIDController::setSetKp(double nkp)
+{
+    kp = nkp;
+}
+
+void PIDController::setSetKi(double nki)
+{
+    ki = nki;
+}
+
+void PIDController::setSetKd(double nkd)
+{
+    kd = nkd;
+}
+
 void PIDController::setDt(double sample_time)
 {
     dt = sample_time;

@@ -1,29 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 
-	import Chart from 'chart.js/auto';
-	import 'chartjs-adapter-date-fns';
-
-	import annotationPlugin from 'chartjs-plugin-annotation';
-
-	import { nl } from 'date-fns/locale';
-
 	import { pad } from '$lib/utils';
 	import { page } from '$app/state';
 
 	let gateway = `ws://${page.url.host}/ws`;
 	let ws: WebSocket;
 
-	const now = new Date();
-
 	let mode = $state('off');
 	let temp = $state(300);
 	let relais = $state(0);
 	let targetTemp = $state(300);
-	let setOverShoot = 20;
-	let setUnderShoot = 20;
-	let targetTempOverShoot = $state(targetTemp);
-	let targetTempUnderShoot = $state(targetTemp);
 	let calculatedPidOutput = $state(0);
 
 	let lastSwitch = new Date();
@@ -34,7 +21,6 @@
 	let pauseGraphUpdate = $state(false);
 	let spoofInterval = 250;
 	let speedFactor = 250 / spoofInterval;
-	const switchDelay = (30 / speedFactor) * 1000;
 	let pwmOn = $state(2);
 	let pwmOnDelay = (2 / speedFactor) * 1000;
 	let pwmOff = $state(4);
@@ -44,260 +30,261 @@
 	let ki = $state(0.25);
 	let kd = $state(0.25);
 
-	let maxValues = 4 * 2 * 60 * 60; // 120 minutes (4 values/sec)
+	let maxValues = 24 * 2 * 60 * 60; // 24h (2 values/sec)
 
 	let temperatureData: Array<[number, number]> = [];
 	let relaisData: Array<[number, number]> = [];
+	let powerData: Array<[number, number]> = [];
 
 	let downloadCSVButton: HTMLElement;
 	let modeSpan: HTMLElement;
 
-	const getRelaisBands = () => {
-		let relaisBands = {};
-		let active = false;
-		let count = 0;
+	// const getRelaisBands = () => {
+	// 	let relaisBands = {};
+	// 	let active = false;
+	// 	let count = 0;
 
-		for (let r of relaisData) {
-			let key = 'relais' + count;
-			if (r[1] === 1 && !active) {
-				active = true;
-				relaisBands[key] = {
-					type: 'box',
-					backgroundColor: 'rgba(255, 0, 0, 0.1)',
-					borderWidth: 1,
-					borderColor: 'rgba(255, 0, 0, 0.5)',
-					drawTime: 'beforeDraw',
+	// 	for (let r of relaisData) {
+	// 		let key = 'relais' + count;
+	// 		if (r[1] === 1 && !active) {
+	// 			active = true;
+	// 			relaisBands[key] = {
+	// 				type: 'box',
+	// 				backgroundColor: 'rgba(255, 0, 0, 0.1)',
+	// 				borderWidth: 1,
+	// 				borderColor: 'rgba(255, 0, 0, 0.5)',
+	// 				drawTime: 'beforeDraw',
 
-					xMax: relaisData[relaisData.length - 1][0] + 10,
-					xMin: r[0]
-				};
-			}
-			if (r[1] === 0 && active) {
-				relaisBands[key]['xMax'] = r[0];
-				active = false;
-				count++;
-			}
-		}
-		return relaisBands;
-	};
+	// 				xMax: relaisData[relaisData.length - 1][0] + 10,
+	// 				xMin: r[0]
+	// 			};
+	// 		}
+	// 		if (r[1] === 0 && active) {
+	// 			relaisBands[key]['xMax'] = r[0];
+	// 			active = false;
+	// 			count++;
+	// 		}
+	// 	}
+	// 	return relaisBands;
+	// };
 
-	const getAnnotations = () => {
-		return {
-			annotations: {
-				limitGreen: {
-					type: 'box',
-					drawTime: 'beforeDraw',
-					backgroundColor: 'rgba(0, 255, 133, 0.25)',
-					borderWidth: 0,
-					yMax: 0,
-					yMin: 350
-				},
-				limitOrange: {
-					type: 'box',
-					drawTime: 'beforeDraw',
-					backgroundColor: 'rgba(255, 138, 0 ,0.25)',
-					borderWidth: 0,
-					yMax: 350,
-					yMin: 450
-				},
-				limitRed: {
-					type: 'box',
-					drawTime: 'beforeDraw',
+	// const getAnnotations = () => {
+	// 	return {
+	// 		annotations: {
+	// 			limitGreen: {
+	// 				type: 'box',
+	// 				drawTime: 'beforeDraw',
+	// 				backgroundColor: 'rgba(0, 255, 133, 0.25)',
+	// 				borderWidth: 0,
+	// 				yMax: 0,
+	// 				yMin: 350
+	// 			},
+	// 			limitOrange: {
+	// 				type: 'box',
+	// 				drawTime: 'beforeDraw',
+	// 				backgroundColor: 'rgba(255, 138, 0 ,0.25)',
+	// 				borderWidth: 0,
+	// 				yMax: 350,
+	// 				yMin: 450
+	// 			},
+	// 			limitRed: {
+	// 				type: 'box',
+	// 				drawTime: 'beforeDraw',
 
-					backgroundColor: 'rgba(255, 0, 0, 0.25)',
-					borderWidth: 0,
-					yMax: 450,
-					yMin: 550
-				},
-				targetTemp: {
-					type: 'line',
-					drawTime: 'beforeDraw',
-					borderColor: 'black',
-					borderWidth: 2,
-					scaleID: 'y',
-					value: targetTemp,
-					borderDash: [6, 6],
-					borderDashOffset: 0,
-					label: {
-						backgroundColor: 'transparent',
-						display: true,
-						color: 'rgba(0,0,0, 1)',
-						content: 'Target temp',
-						position: 'center',
-						yAdjust: -9
-					}
-				},
-				...getRelaisBands()
-			}
-		};
-	};
+	// 				backgroundColor: 'rgba(255, 0, 0, 0.25)',
+	// 				borderWidth: 0,
+	// 				yMax: 450,
+	// 				yMin: 550
+	// 			},
+	// 			targetTemp: {
+	// 				type: 'line',
+	// 				drawTime: 'beforeDraw',
+	// 				borderColor: 'black',
+	// 				borderWidth: 2,
+	// 				scaleID: 'y',
+	// 				value: targetTemp,
+	// 				borderDash: [6, 6],
+	// 				borderDashOffset: 0,
+	// 				label: {
+	// 					backgroundColor: 'transparent',
+	// 					display: true,
+	// 					color: 'rgba(0,0,0, 1)',
+	// 					content: 'Target temp',
+	// 					position: 'center',
+	// 					yAdjust: -9
+	// 				}
+	// 			},
+	// 			...getRelaisBands()
+	// 		}
+	// 	};
+	// };
 
-	let chart: Chart;
-	Chart.register(annotationPlugin);
+	// let chart: Chart;
+	// Chart.register(annotationPlugin);
 
 	onMount(() => {
 		initWebSocket();
 
-		chart = new Chart(canvas, {
-			type: 'line',
-			options: {
-				plugins: {
-					legend: {
-						display: false
-					},
-					tooltip: {
-						mode: 'nearest',
-						intersect: false,
-						animation: false
-					},
-					annotation: getAnnotations()
-				},
-				scales: {
-					x: {
-						type: 'time',
-						time: {
-							tooltipFormat: 'HH:mm:ss',
+		// chart = new Chart(canvas, {
+		// 	type: 'line',
+		// 	options: {
+		// 		plugins: {
+		// 			legend: {
+		// 				display: false
+		// 			},
+		// 			tooltip: {
+		// 				mode: 'nearest',
+		// 				intersect: false,
+		// 				animation: false
+		// 			},
+		// 			annotation: getAnnotations()
+		// 		},
+		// 		scales: {
+		// 			x: {
+		// 				type: 'time',
+		// 				time: {
+		// 					tooltipFormat: 'HH:mm:ss',
 
-							displayFormats: {
-								millisecond: 'HH:mm:ss.S',
-								second: 'HH:mm:ss',
-								minute: 'HH:mm',
-								hour: 'HH:mm'
-							}
-						},
-						adapters: {
-							date: {
-								locale: nl
-							}
-						}
-					},
-					y: {
-						min: 0
-					}
-				}
-			},
-			data: {
-				labels: temperatureData.map((row) => row[0]),
-				datasets: [
-					{
-						label: 'Temperature',
-						data: temperatureData.map((row) => row[1]),
-						fill: true,
-						tension: 0.25
-					}
-				]
-			}
-		});
+		// 					displayFormats: {
+		// 						millisecond: 'HH:mm:ss.S',
+		// 						second: 'HH:mm:ss',
+		// 						minute: 'HH:mm',
+		// 						hour: 'HH:mm'
+		// 					}
+		// 				},
+		// 				adapters: {
+		// 					date: {
+		// 						locale: nl
+		// 					}
+		// 				}
+		// 			},
+		// 			y: {
+		// 				min: 0
+		// 			}
+		// 		}
+		// 	},
+		// 	data: {
+		// 		labels: temperatureData.map((row) => row[0]),
+		// 		datasets: [
+		// 			{
+		// 				label: 'Temperature',
+		// 				data: temperatureData.map((row) => row[1]),
+		// 				fill: true,
+		// 				tension: 0.25
+		// 			}
+		// 		]
+		// 	}
+		// });
 
-		if (import.meta.env.DEV) {
-			// spoof some test data
-			setInterval(() => {
-				if (temperatureData.length > maxValues) {
-					temperatureData.shift();
-					relaisData.shift();
-				}
-				let d = new Date();
+		// if (import.meta.env.DEV) {
+		// 	// spoof some test data
+		// 	setInterval(() => {
+		// 		if (temperatureData.length > maxValues) {
+		// 			temperatureData.shift();
+		// 			relaisData.shift();
+		// 		}
+		// 		let d = new Date();
 
-				if (temp < targetTemp / 2) {
-					temp = temp + Math.random() * 0.5 - 0.125;
-				} else if (temp < targetTemp / (3 / 2)) {
-					temp = temp + Math.random() * 0.5 - 0.15;
-				} else {
-					temp = temp + Math.random() * 0.5 - 0.25;
-				}
+		// 		if (temp < targetTemp / 2) {
+		// 			temp = temp + Math.random() * 0.5 - 0.125;
+		// 		} else if (temp < targetTemp / (3 / 2)) {
+		// 			temp = temp + Math.random() * 0.5 - 0.15;
+		// 		} else {
+		// 			temp = temp + Math.random() * 0.5 - 0.25;
+		// 		}
 
-				let shootFactor = Math.min(
-					((d.getTime() - lastSwitch.getTime()) / speedFactor -
-						(lastSwitchDuration * 0.25) / speedFactor) /
-						((3 * 60 * 1000) / speedFactor),
-					1
-				); // 5mins
-				shootFactor = shootFactor;
+		// 		let shootFactor = Math.min(
+		// 			((d.getTime() - lastSwitch.getTime()) / speedFactor -
+		// 				(lastSwitchDuration * 0.25) / speedFactor) /
+		// 				((3 * 60 * 1000) / speedFactor),
+		// 			1
+		// 		); // 5mins
+		// 		shootFactor = shootFactor;
 
-				if (relais == 0) {
-					temp = temp - 0.3 * shootFactor;
-				} else {
-					temp = temp + 0.3 * shootFactor;
-				}
+		// 		if (relais == 0) {
+		// 			temp = temp - 0.3 * shootFactor;
+		// 		} else {
+		// 			temp = temp + 0.3 * shootFactor;
+		// 		}
 
-				let mod = temp % 0.25;
-				if (mod > 0.125) {
-					temp = temp - mod + 0.25;
-				} else {
-					temp = temp - mod;
-				}
+		// 		let mod = temp % 0.25;
+		// 		if (mod > 0.125) {
+		// 			temp = temp - mod + 0.25;
+		// 		} else {
+		// 			temp = temp - mod;
+		// 		}
 
-				let derivedShootFactor = Math.min(
-					(d.getTime() - lastSwitch.getTime()) / speedFactor / ((3 * 60 * 1000) / speedFactor),
-					1
-				); // 5mins
+		// 		let derivedShootFactor = Math.min(
+		// 			(d.getTime() - lastSwitch.getTime()) / speedFactor / ((3 * 60 * 1000) / speedFactor),
+		// 			1
+		// 		); // 5mins
 
-				let overshoot = setOverShoot * derivedShootFactor; // derive over 5 mins -> 1 min eq. 3°C, 5mins eq. 15°C
-				let dirivedOvershoot = Math.min(overshoot, setOverShoot);
+		// 		let overshoot = setOverShoot * derivedShootFactor; // derive over 5 mins -> 1 min eq. 3°C, 5mins eq. 15°C
+		// 		let dirivedOvershoot = Math.min(overshoot, setOverShoot);
 
-				let undershoot = setUnderShoot * derivedShootFactor; // derive over 5 min -> 1 min eq. 3°C, 5mins eq. 15°C
-				let dirivedUndershoot = Math.min(undershoot, setUnderShoot);
+		// 		let undershoot = setUnderShoot * derivedShootFactor; // derive over 5 min -> 1 min eq. 3°C, 5mins eq. 15°C
+		// 		let dirivedUndershoot = Math.min(undershoot, setUnderShoot);
 
-				targetTempOverShoot = targetTemp - dirivedOvershoot;
-				targetTempUnderShoot = targetTemp + dirivedUndershoot;
+		// 		targetTempOverShoot = targetTemp - dirivedOvershoot;
+		// 		targetTempUnderShoot = targetTemp + dirivedUndershoot;
 
-				if (mode === 'auto_switch') {
-					if (d.getTime() - lastSwitch.getTime() > switchDelay) {
-						if (temp > targetTempOverShoot) {
-							// > 270 °C
-							if (relais == 1) {
-								relais = 0;
+		// 		if (mode === 'auto_switch') {
+		// 			if (d.getTime() - lastSwitch.getTime() > switchDelay) {
+		// 				if (temp > targetTempOverShoot) {
+		// 					// > 270 °C
+		// 					if (relais == 1) {
+		// 						relais = 0;
 
-								targetTempOverShoot = targetTemp;
-								targetTempUnderShoot = targetTemp;
-								lastSwitchDuration = d.getTime() - lastSwitch.getTime();
-								lastSwitch = new Date();
-							}
-						}
-					}
-					if (d.getTime() - lastSwitch.getTime() > switchDelay) {
-						if (temp < targetTempUnderShoot) {
-							// < 310°C
-							if (relais == 0) {
-								relais = 1;
+		// 						targetTempOverShoot = targetTemp;
+		// 						targetTempUnderShoot = targetTemp;
+		// 						lastSwitchDuration = d.getTime() - lastSwitch.getTime();
+		// 						lastSwitch = new Date();
+		// 					}
+		// 				}
+		// 			}
+		// 			if (d.getTime() - lastSwitch.getTime() > switchDelay) {
+		// 				if (temp < targetTempUnderShoot) {
+		// 					// < 310°C
+		// 					if (relais == 0) {
+		// 						relais = 1;
 
-								targetTempOverShoot = targetTemp;
-								targetTempUnderShoot = targetTemp;
-								lastSwitchDuration = d.getTime() - lastSwitch.getTime();
-								lastSwitch = new Date();
-							}
-						}
-					}
-				}
+		// 						targetTempOverShoot = targetTemp;
+		// 						targetTempUnderShoot = targetTemp;
+		// 						lastSwitchDuration = d.getTime() - lastSwitch.getTime();
+		// 						lastSwitch = new Date();
+		// 					}
+		// 				}
+		// 			}
+		// 		}
 
-				if (mode === 'pwm') {
-					if (d.getTime() - lastSwitch.getTime() > pwmOnDelay) {
-						if (relais) {
-							relais = 0;
-							lastSwitch = new Date();
-						}
-					}
-					if (d.getTime() - lastSwitch.getTime() > pwmOffDelay) {
-						if (!relais) {
-							relais = 1;
-							lastSwitch = new Date();
-						}
-					}
-				}
+		// 		if (mode === 'pwm') {
+		// 			if (d.getTime() - lastSwitch.getTime() > pwmOnDelay) {
+		// 				if (relais) {
+		// 					relais = 0;
+		// 					lastSwitch = new Date();
+		// 				}
+		// 			}
+		// 			if (d.getTime() - lastSwitch.getTime() > pwmOffDelay) {
+		// 				if (!relais) {
+		// 					relais = 1;
+		// 					lastSwitch = new Date();
+		// 				}
+		// 			}
+		// 		}
 
-				temperatureData.push([d.getTime(), temp]);
-				relaisData.push([d.getTime(), relais]);
+		// 		temperatureData.push([d.getTime(), temp]);
+		// 		relaisData.push([d.getTime(), relais]);
 
-				if (!pauseGraphUpdate) {
-					chart.options.plugins.annotation = getAnnotations();
-					chart.data.labels.push(d.getTime());
-					chart.data.datasets.forEach((dataset) => {
-						dataset.data.push(temp);
-					});
-					chart.update('none');
-				}
-			}, spoofInterval);
-		}
+		// 		if (!pauseGraphUpdate) {
+		// 			chart.options.plugins.annotation = getAnnotations();
+		// 			chart.data.labels.push(d.getTime());
+		// 			chart.data.datasets.forEach((dataset) => {
+		// 				dataset.data.push(temp);
+		// 			});
+		// 			chart.update('none');
+		// 		}
+		// 	}, spoofInterval);
+		// }
 	});
 
 	const getReadings = () => {
@@ -341,26 +328,26 @@
 				if (temperatureData.length > maxValues) {
 					temperatureData.shift();
 				}
-				temperatureData.push([d.getTime(), myObj[key]]);
 				temp = myObj[key];
+				temperatureData.push([d.getTime(), temp]);
 			} else if (key === 'relais') {
 				if (relaisData.length > maxValues) {
 					relaisData.shift();
 				}
-				relaisData.push([d.getTime(), myObj[key]]);
 				if (myObj[key]) {
 					relais = 1;
 				} else {
 					relais = 0;
 				}
+				relaisData.push([d.getTime(), relais]);
 			} else if (key === 'target_temp') {
 				targetTemp = myObj[key];
-			} else if (key === 'derived_overshoot') {
-				targetTempOverShoot = myObj[key];
-			} else if (key === 'derived_undershoot') {
-				targetTempUnderShoot = myObj[key];
 			} else if (key === 'pid') {
+				if (powerData.length > maxValues) {
+					powerData.shift();
+				}
 				calculatedPidOutput = myObj[key];
+				powerData.push([d.getTime(), calculatedPidOutput]);
 			} else if (key === 'pwm_on') {
 				pwmOn = Number(myObj[key]) / 1000;
 			} else if (key === 'pwm_off') {
@@ -376,14 +363,14 @@
 				modeSpan.innerText = mode;
 			}
 
-			if (!pauseGraphUpdate) {
-				chart.options.plugins.annotation = getAnnotations();
-				chart.data.labels.push(d.getTime());
-				chart.data.datasets.forEach((dataset) => {
-					dataset.data.push(temp);
-				});
-				chart.update('none');
-			}
+			// if (!pauseGraphUpdate) {
+			// 	chart.options.plugins.annotation = getAnnotations();
+			// 	chart.data.labels.push(d.getTime());
+			// 	chart.data.datasets.forEach((dataset) => {
+			// 		dataset.data.push(temp);
+			// 	});
+			// 	chart.update('none');
+			// }
 		}
 	};
 
@@ -412,8 +399,6 @@
 			ws.send('setTargetTemp: ' + pad(value, 3));
 		} else {
 			targetTemp = value;
-			targetTempOverShoot = value;
-			targetTempUnderShoot = value;
 		}
 	};
 
@@ -464,10 +449,10 @@
 	};
 
 	const prepareDownloadCSV = () => {
-		let csvContent = 'Time,Temp,Relais\n';
+		let csvContent = 'Time,Temp,Relais,Power\n';
 
 		for (let [i, temp] of temperatureData.entries()) {
-			csvContent += `${temp[0]},${temp[1]},${relaisData[i] ? relaisData[i][1] : ''}\n`;
+			csvContent += `${temp[0]},${temp[1]},${relaisData[i] ? relaisData[i][1] : ''},${powerData[i][1]}\n`;
 		}
 
 		const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8,' });
@@ -585,17 +570,19 @@
 			{/if}
 			{#if mode === 'pid'}
 				<div class="mt-3 flex items-center gap-1">
-					PID: {calculatedPidOutput.toFixed(0)}% {(calculatedPidOutput * 12).toFixed(0)}W
+					PID: {calculatedPidOutput ? calculatedPidOutput.toFixed(0) : 0}% {calculatedPidOutput
+						? (calculatedPidOutput * 12).toFixed(0)
+						: 0}W
 				</div>
-				<div>ON:{pwmOn.toFixed(2)}s OFF:{pwmOff.toFixed(2)}s</div>
-				<div class="mt-3 flex w-full justify-between px-9">
+				<div>ON:{pwmOn.toFixed(2)}s OFF:{pwmOff ? pwmOff.toFixed(2) : 0}s</div>
+				<div class="mt-3 flex w-full justify-between px-13">
 					<div>Kp</div>
 					<div>Ki</div>
-					<div>Kd</div>
+					<!-- <div>Kd</div> -->
 				</div>
 				<div class="flex gap-1">
 					<input
-						class="min-w-[85px] rounded"
+						class="min-w-[120px] rounded"
 						type="number"
 						min="0"
 						max="50"
@@ -605,7 +592,7 @@
 						onchange={(e) => changeKValue(e, 'p')}
 					/>
 					<input
-						class="min-w-[85px] rounded"
+						class="min-w-[120px] rounded"
 						type="number"
 						min="0"
 						max="50"
@@ -614,7 +601,7 @@
 						id="target_temperature"
 						onchange={(e) => changeKValue(e, 'i')}
 					/>
-					<input
+					<!-- <input
 						class="min-w-[85px] rounded"
 						type="number"
 						min="0"
@@ -623,7 +610,7 @@
 						value={kd}
 						id="target_temperature"
 						onchange={(e) => changeKValue(e, 'd')}
-					/>
+					/> -->
 				</div>
 			{/if}
 		</div>

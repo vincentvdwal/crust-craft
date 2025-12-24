@@ -10,47 +10,52 @@
 #include "secrets.h"
 #include "pid.h"
 
+// #define RELAY 21;
+// #define THERMO_DO 19;
+// #define THERMO_CS 23;
+// #define THERMO_CLK 5;
+
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// Json Variable to Hold Sensor Readings
-JsonDocument readings;
-String jsonString;
-
 // Timer variables
-unsigned long lastTime = 0;
-unsigned long timerDelay = 500;
+unsigned long lastSensor = 0;
+unsigned long SENSOR_INTERVAL = 100;
+
+unsigned long lastWebSocket = 0;
+unsigned long WS_INTERVAL = 500;
 
 int relay = 21;
 int thermoDO = 19;
 int thermoCS = 23;
 int thermoCLK = 5;
 
-MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
-
 float temperature = 0;
 int targetTemp = 300;
-float setOverShoot = 20;
-float setUnderShoot = 20;
-float derivedOverShoot = targetTemp;
-float derivedUnderShoot = targetTemp;
+
 unsigned long lastSwitch = 0;
-unsigned long autoSwitchDelay = 20000; // 20s
-float pwmSwitchDelayOn = 2000;         // 4s
-float pwmSwitchDelayOff = 4000;        // 7s
+float pwmSwitchDelayOn = 2000;  // 2s
+float pwmSwitchDelayOff = 4000; // 4s
+
 float power = 0;
 
-float kp = 0.25;
-float ki = 0.25;
-float kd = 0.25;
+float kp = 0.540938;
+float ki = 0.000721;
+float kd = 0.0;
 
 String mode = "off";
 
-PIDController pid(kp, ki, kd, 100.0, 0.0, 50.0); // Kp, Ki, Kd, max, min, integ_max
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+
+PIDController pid(kp, ki, kd, 100.0, 0.0, 100.0); // Kp, Ki, Kd, max, min, max_integral
 
 // Get Sensor Readings and return JSON object
 String getSensorReadings()
+
 {
+  JsonDocument readings;
+  String jsonString;
+
   temperature = thermocouple.readCelsius();
 
   readings["temperature"] = temperature;
@@ -65,10 +70,10 @@ String getSensorReadings()
   }
 
   readings["target_temp"] = targetTemp;
-  readings["derived_overshoot"] = derivedOverShoot;
-  readings["derived_undershoot"] = derivedUnderShoot;
+
   readings["mode"] = mode;
   readings["pid"] = power;
+
   readings["pwm_on"] = pwmSwitchDelayOn;
   readings["pwm_off"] = pwmSwitchDelayOff;
 
@@ -100,7 +105,8 @@ void initWiFi()
   while (WiFi.status() != WL_CONNECTED)
   {
     Serial.print('.');
-    delay(1000);
+    delay(SENSOR_INTERVAL);
+    yield();
   }
   Serial.println(WiFi.localIP());
 }
@@ -108,12 +114,6 @@ void initWiFi()
 void notifyClients(String sensorReadings)
 {
   ws.textAll(sensorReadings);
-}
-
-void resetDerivedValues()
-{
-  derivedOverShoot = targetTemp;
-  derivedUnderShoot = targetTemp;
 }
 
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
@@ -142,7 +142,6 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
         digitalWrite(relay, HIGH);
         lastSwitch = millis();
       }
-      resetDerivedValues();
     }
     if (message.startsWith("setTargetTemp"))
     {
@@ -180,19 +179,19 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
     {
       String k = message.substring(6, 12);
       kp = k.toFloat();
-      // pid.setSetKp(0.3);
+      pid.setSetKp(kp);
     }
     if (message.startsWith("setKi"))
     {
       String k = message.substring(6, 12);
       ki = k.toFloat();
-      // pid.setSetKp(0.3);
+      pid.setSetKi(ki);
     }
     if (message.startsWith("setKd"))
     {
       String k = message.substring(6, 12);
       kd = k.toFloat();
-      // pid.setSetKp(0.3);
+      pid.setSetKd(kd);
     }
     if (message.startsWith("setPWMOn"))
     {
@@ -241,48 +240,6 @@ void initWebSocket()
 
 void regulateRelais()
 {
-  if (mode == "auto_switch")
-  {
-    float sinceLastSwitch = millis() - lastSwitch;
-    float fiveMinutesInMillis = 5 * 60 * 1000;
-    float shootFactor = sinceLastSwitch / fiveMinutesInMillis;
-
-    float overshoot = setOverShoot * shootFactor; // derive over 5 mins -> 1 min eq. 3°C, 5mins eq. 15°C
-    float dirivedOvershoot = min(overshoot, setOverShoot);
-
-    float undershoot = setUnderShoot * shootFactor; // derive over 5 min -> 1 min eq. 3°C, 5mins eq. 15°C
-    float dirivedUndershoot = min(undershoot, setUnderShoot);
-
-    float overShootCorrectedTarget = derivedOverShoot = targetTemp - dirivedOvershoot;
-    float underShootCorrectedTarget = derivedUnderShoot = targetTemp + dirivedUndershoot;
-
-    if ((millis() - lastSwitch) > autoSwitchDelay)
-    {
-
-      if (temperature > overShootCorrectedTarget) // > 280°C
-      {
-        if (digitalRead(relay) == HIGH)
-        {
-          digitalWrite(relay, LOW);
-          lastSwitch = millis();
-          resetDerivedValues();
-        }
-      }
-    }
-    if ((millis() - lastSwitch) > autoSwitchDelay)
-    {
-      if (temperature < underShootCorrectedTarget) // < 320°C
-      {
-        if (digitalRead(relay) == LOW)
-        {
-          digitalWrite(relay, HIGH);
-          lastSwitch = millis();
-          resetDerivedValues();
-        }
-      }
-    }
-  }
-
   if (mode == "pwm")
   {
     if ((millis() - lastSwitch) > pwmSwitchDelayOn)
@@ -305,7 +262,7 @@ void regulateRelais()
   }
   if (mode == "pid")
   {
-    // output = Kp×error + Ki×∫error×dt + Kd×(Δerror/Δt)`[^2][^5]
+    // output = Kp×error + Ki×∫error×dt + Kd×(Δerror/Δt)
     power = pid.compute(temperature);
     pwmSwitchDelayOff = (pwmSwitchDelayOn / (power / 100)) - pwmSwitchDelayOn;
 
@@ -353,7 +310,7 @@ void setup()
 
   // Create PID controller instance
   pid.setSetpoint(targetTemp);
-  pid.setDt(2);
+  pid.setDt(SENSOR_INTERVAL / 1000);
 
   ElegantOTA.begin(&server);
 
@@ -363,12 +320,17 @@ void setup()
 
 void loop()
 {
-  if ((millis() - lastTime) > timerDelay)
+  if ((millis() - lastSensor) > SENSOR_INTERVAL)
+  {
+    regulateRelais();
+    lastSensor = millis();
+  }
+
+  if ((millis() - lastWebSocket) > WS_INTERVAL)
   {
     String sensorReadings = getSensorReadings();
     notifyClients(sensorReadings);
-    regulateRelais();
-    lastTime = millis();
+    lastWebSocket = millis();
   }
 
   ws.cleanupClients();

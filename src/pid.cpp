@@ -51,16 +51,16 @@ double PIDController::compute(double current_temp)
     integral += ki * error * dt;
     integral = clamp(integral, -integral_max, integral_max);
 
-    // Derivative
-    double d_term = 0.0;
-    if (!first_run)
-    {
-        d_term = kd * (error - prev_error) / dt;
-    }
-    first_run = false;
+    // // Derivative
+    // double d_term = 0.0;
+    // if (!first_run)
+    // {
+    //     d_term = kd * (error - prev_error) / dt;
+    // }
+    // first_run = false;
 
     // Output
-    double output = p_term + integral + d_term;
+    double output = p_term + integral; // d_term;
     output = clamp(output, min_output, max_output);
 
     prev_error = error;

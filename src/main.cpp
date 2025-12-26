@@ -39,11 +39,11 @@ float pwmSwitchDelayOff = 4000; // 4s
 
 float power = 0;
 
-float kp = 0.540938;
-float ki = 0.000721;
+float kp = 0.540721828;
+float ki = 0.004960751;
 float kd = 0.0;
 
-String mode = "off";
+String mode = "manual";
 
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
@@ -56,26 +56,19 @@ String getSensorReadings()
   JsonDocument readings;
   String jsonString;
 
-  temperature = thermocouple.readCelsius();
+  readings["mode"] = mode;
 
+  temperature = thermocouple.readCelsius();
   readings["temperature"] = temperature;
 
-  if (digitalRead(relay) == HIGH)
-  {
-    readings["relais"] = 1;
-  }
-  else
-  {
-    readings["relais"] = 0;
-  }
+  readings["relais"] = digitalRead(relay) == HIGH ? 1 : 0;
 
   readings["target_temp"] = targetTemp;
 
-  readings["mode"] = mode;
-  readings["pid"] = power;
-
   readings["pwm_on"] = pwmSwitchDelayOn;
   readings["pwm_off"] = pwmSwitchDelayOff;
+
+  readings["pid"] = power;
 
   readings["kp"] = kp;
   readings["ki"] = ki;
@@ -123,19 +116,19 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
   {
     data[len] = 0;
     String message = (char *)data;
-    if (strcmp((char *)data, "getReadings") == 0)
+    if (message.startsWith("getReadings"))
     {
       String sensorReadings = getSensorReadings();
       notifyClients(sensorReadings);
     };
-    if (strcmp((char *)data, "switchRelais") == 0)
+    if (message.startsWith("switchRelais"))
     {
       Serial.printf("\nSwitch Relais");
       if (digitalRead(relay) == HIGH)
       {
         digitalWrite(relay, LOW);
         lastSwitch = millis();
-        mode = "off";
+        mode = "manual";
       }
       else
       {
@@ -154,11 +147,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
     }
     if (message.startsWith("setMode"))
     {
-      if (message.indexOf("auto_switch") > 0)
-      {
-        mode = "auto_switch";
-      }
-      else if (message.indexOf("pwm") > 0)
+      if (message.indexOf("pwm") > 0)
       {
         mode = "pwm";
       }
@@ -168,7 +157,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
       }
       else
       {
-        mode = "off";
+        mode = "manual";
         digitalWrite(relay, LOW);
         lastSwitch = millis();
       }

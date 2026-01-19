@@ -39,8 +39,8 @@ float pwmSwitchDelayOff = 4000; // 4s
 
 float power = 0;
 
-float kp = 0.540721828;
-float ki = 0.004960751;
+float kp = 0.6;
+float ki = 0.1;
 float kd = 0.0;
 
 String mode = "manual";

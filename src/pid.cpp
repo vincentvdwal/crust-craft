@@ -60,7 +60,7 @@ double PIDController::compute(double current_temp)
     // first_run = false;
 
     // Output
-    double output = p_term + integral; // d_term;
+    double output = p_term + integral; // + d_term;
     output = clamp(output, min_output, max_output);
 
     prev_error = error;

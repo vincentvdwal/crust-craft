@@ -1,460 +1,351 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-
-	import { pad } from '$lib/utils';
 	import { page } from '$app/state';
+	import { SpoofSocket } from '$lib/spoof';
+	import { Sun, Moon } from 'lucide-svelte';
+	import {
+		Chart,
+		LineController,
+		LineElement,
+		PointElement,
+		LinearScale,
+		TimeScale,
+		Filler,
+		Tooltip,
+		type ChartDataset
+	} from 'chart.js';
+	import 'chartjs-adapter-date-fns';
+
+	Chart.register(
+		LineController,
+		LineElement,
+		PointElement,
+		LinearScale,
+		TimeScale,
+		Filler,
+		Tooltip
+	);
+
+	// Rolling window for the chart (~5 min at 2 pts/sec)
+	const CHART_WINDOW = 600;
+	// Full buffer kept for CSV export (24h at 2 pts/sec)
+	const MAX_STORED = 24 * 2 * 60 * 60;
 
 	let gateway = `ws://${page.url.host}/ws`;
 	let ws: WebSocket;
 
-	let mode = $state('off');
-	let temp = $state(300);
+	let mode = $state('manual');
+	let temp = $state(0);
 	let relais = $state(0);
-	let targetTemp = $state(300);
+	let targetTemp = $state(460);
 	let calculatedPidOutput = $state(0);
 
-	let lastSwitch = new Date();
-	let lastSwitchDuration = 0;
+	let pwmOn = $state(2);
+	let pwmOff = $state(4);
 
-	let canvas: HTMLCanvasElement;
+	let kp = $state(0.6);
+	let ki = $state(0.1);
+	let kd = $state(0.0);
 
 	let pauseGraphUpdate = $state(false);
-	let spoofInterval = 250;
-	let speedFactor = 250 / spoofInterval;
-	let pwmOn = $state(2);
-	let pwmOnDelay = (2 / speedFactor) * 1000;
-	let pwmOff = $state(4);
-	let pwmOffDelay = (4 / speedFactor) * 1000;
+	let darkMode = $state(true);
 
-	let kp = $state(0.25);
-	let ki = $state(0.25);
-	let kd = $state(0.25);
+	$effect(() => {
+		document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+		if (chart) {
+			const tickColor = darkMode ? '#7a7f96' : '#6b7280';
+			const gridColor = darkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.07)';
+			(chart.options.scales!.x as any).ticks.color = tickColor;
+			(chart.options.scales!.x as any).grid.color = gridColor;
+			(chart.options.scales!.y as any).ticks.color = tickColor;
+			(chart.options.scales!.y as any).grid.color = gridColor;
+			chart.update('none');
+		}
+	});
 
-	let maxValues = 24 * 2 * 60 * 60; // 24h (2 values/sec)
+	// Temperature colour / class helpers
+	const TEMP_ZONE_COLORS = [
+		{ max: 350, color: '#22c55e' },
+		{ max: 420, color: '#eab308' },
+		{ max: 480, color: '#f97316' },
+		{ max: 520, color: '#ef4444' }
+	] as const;
 
+	function tempColor(t: number): string {
+		for (const z of TEMP_ZONE_COLORS) if (t < z.max) return z.color;
+		return '#ef4444';
+	}
+	function tempIsExtreme(t: number): boolean {
+		return t >= 520;
+	}
+
+	// Custom Chart.js plugin that draws temperature zone bands behind the data
+	const tempZonesPlugin = {
+		id: 'tempZones',
+		beforeDatasetsDraw(c: Chart) {
+			const { ctx, scales } = c;
+			const xs = scales['x'];
+			const ys = scales['y'];
+			if (!xs || !ys) return;
+
+			const left = xs.left;
+			const right = xs.right;
+			const width = right - left;
+
+			const zones = [
+				{ min: 0, max: 350, fill: 'rgba(34,197,94,0.07)', stripe: false },
+				{ min: 350, max: 420, fill: 'rgba(234,179,8,0.09)', stripe: false },
+				{ min: 420, max: 480, fill: 'rgba(249,115,22,0.10)', stripe: false },
+				{ min: 480, max: 520, fill: 'rgba(239,68,68,0.12)', stripe: false },
+				{ min: 520, max: 700, fill: 'rgba(239,68,68,0.06)', stripe: true }
+			];
+			const labels = ['Low', 'Medium', 'High', 'Very High', 'Extreme'];
+
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(left, ys.top, width, ys.bottom - ys.top);
+			ctx.clip();
+
+			for (let i = 0; i < zones.length; i++) {
+				const z = zones[i];
+				const yTop = ys.getPixelForValue(z.max);
+				const yBot = ys.getPixelForValue(z.min);
+				const h = yBot - yTop;
+				if (h <= 0) continue;
+
+				ctx.fillStyle = z.fill;
+				ctx.fillRect(left, yTop, width, h);
+
+				if (z.stripe) {
+					const sw = 8;
+					ctx.save();
+					ctx.beginPath();
+					ctx.rect(left, yTop, width, h);
+					ctx.clip();
+					ctx.strokeStyle = 'rgba(239,68,68,0.18)';
+					ctx.lineWidth = sw;
+					ctx.beginPath();
+					for (let xi = left - h; xi < right + h; xi += sw * 2.5) {
+						ctx.moveTo(xi, yBot);
+						ctx.lineTo(xi + h, yTop);
+					}
+					ctx.stroke();
+					ctx.restore();
+				}
+
+				if (h > 14) {
+					ctx.fillStyle = darkMode ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.25)';
+					ctx.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+					ctx.textAlign = 'right';
+					ctx.textBaseline = 'middle';
+					ctx.fillText(labels[i].toUpperCase(), right - 6, yTop + h / 2);
+				}
+			}
+
+			ctx.restore();
+		}
+	};
+
+	// Full history – only used for CSV export
 	let temperatureData: Array<[number, number]> = [];
 	let relaisData: Array<[number, number]> = [];
 	let powerData: Array<[number, number]> = [];
 
-	let downloadCSVButton: HTMLElement;
-	let modeSpan: HTMLElement;
+	let canvas: HTMLCanvasElement;
+	let downloadCSVButton: HTMLAnchorElement;
+	let chart: Chart;
 
-	// const getRelaisBands = () => {
-	// 	let relaisBands = {};
-	// 	let active = false;
-	// 	let count = 0;
-
-	// 	for (let r of relaisData) {
-	// 		let key = 'relais' + count;
-	// 		if (r[1] === 1 && !active) {
-	// 			active = true;
-	// 			relaisBands[key] = {
-	// 				type: 'box',
-	// 				backgroundColor: 'rgba(255, 0, 0, 0.1)',
-	// 				borderWidth: 1,
-	// 				borderColor: 'rgba(255, 0, 0, 0.5)',
-	// 				drawTime: 'beforeDraw',
-
-	// 				xMax: relaisData[relaisData.length - 1][0] + 10,
-	// 				xMin: r[0]
-	// 			};
-	// 		}
-	// 		if (r[1] === 0 && active) {
-	// 			relaisBands[key]['xMax'] = r[0];
-	// 			active = false;
-	// 			count++;
-	// 		}
-	// 	}
-	// 	return relaisBands;
-	// };
-
-	// const getAnnotations = () => {
-	// 	return {
-	// 		annotations: {
-	// 			limitGreen: {
-	// 				type: 'box',
-	// 				drawTime: 'beforeDraw',
-	// 				backgroundColor: 'rgba(0, 255, 133, 0.25)',
-	// 				borderWidth: 0,
-	// 				yMax: 0,
-	// 				yMin: 350
-	// 			},
-	// 			limitOrange: {
-	// 				type: 'box',
-	// 				drawTime: 'beforeDraw',
-	// 				backgroundColor: 'rgba(255, 138, 0 ,0.25)',
-	// 				borderWidth: 0,
-	// 				yMax: 350,
-	// 				yMin: 450
-	// 			},
-	// 			limitRed: {
-	// 				type: 'box',
-	// 				drawTime: 'beforeDraw',
-
-	// 				backgroundColor: 'rgba(255, 0, 0, 0.25)',
-	// 				borderWidth: 0,
-	// 				yMax: 450,
-	// 				yMin: 550
-	// 			},
-	// 			targetTemp: {
-	// 				type: 'line',
-	// 				drawTime: 'beforeDraw',
-	// 				borderColor: 'black',
-	// 				borderWidth: 2,
-	// 				scaleID: 'y',
-	// 				value: targetTemp,
-	// 				borderDash: [6, 6],
-	// 				borderDashOffset: 0,
-	// 				label: {
-	// 					backgroundColor: 'transparent',
-	// 					display: true,
-	// 					color: 'rgba(0,0,0, 1)',
-	// 					content: 'Target temp',
-	// 					position: 'center',
-	// 					yAdjust: -9
-	// 				}
-	// 			},
-	// 			...getRelaisBands()
-	// 		}
-	// 	};
-	// };
-
-	// let chart: Chart;
-	// Chart.register(annotationPlugin);
+	// Helper – send a JSON command over the WebSocket
+	const send = (cmd: string, value?: number | string) => {
+		if (ws?.readyState === WebSocket.OPEN) {
+			ws.send(JSON.stringify(value !== undefined ? { cmd, value } : { cmd }));
+		}
+	};
 
 	onMount(() => {
+		chart = new Chart(canvas, {
+			type: 'line',
+			plugins: [tempZonesPlugin],
+			options: {
+				animation: false,
+				responsive: true,
+				maintainAspectRatio: false,
+				elements: { point: { radius: 0 } },
+				plugins: {
+					legend: { display: false },
+					tooltip: { mode: 'nearest', intersect: false }
+				},
+				scales: {
+					x: {
+						type: 'time',
+						time: {
+							tooltipFormat: 'HH:mm:ss',
+							displayFormats: { minute: 'HH:mm', hour: 'HH:mm' }
+						},
+						ticks: { color: '#7a7f96' },
+						grid: { color: 'rgba(255,255,255,0.05)' }
+					},
+					y: {
+						min: 0,
+						ticks: { color: '#7a7f96' },
+						grid: { color: 'rgba(255,255,255,0.05)' }
+					},
+					// Hidden 0-1 axis used exclusively for the relay band
+					y1: {
+						type: 'linear',
+						display: false,
+						min: 0,
+						max: 1,
+						position: 'right',
+						grid: { drawOnChartArea: false }
+					}
+				}
+			},
+			data: {
+				datasets: [
+					{
+						label: 'Temperature',
+						data: [] as { x: number; y: number }[],
+						borderColor: 'rgb(255, 99, 132)',
+						fill: false,
+						tension: 0.1
+					} as ChartDataset<'line'>,
+					{
+						label: 'Target',
+						data: [] as { x: number; y: number }[],
+						borderColor: 'rgba(99, 132, 255, 0.6)',
+						borderDash: [5, 5],
+						fill: false,
+						tension: 0
+					} as ChartDataset<'line'>,
+					{
+						label: 'Relay',
+						data: [] as { x: number; y: number }[],
+						yAxisID: 'y1',
+						borderColor: 'rgba(255, 140, 0, 0.5)',
+						backgroundColor: 'rgba(255, 140, 0, 0.10)',
+						fill: 'origin',
+						stepped: true,
+						tension: 0,
+						borderWidth: 1,
+						pointRadius: 0
+					} as ChartDataset<'line'>
+				]
+			}
+		});
+
 		initWebSocket();
-
-		// chart = new Chart(canvas, {
-		// 	type: 'line',
-		// 	options: {
-		// 		plugins: {
-		// 			legend: {
-		// 				display: false
-		// 			},
-		// 			tooltip: {
-		// 				mode: 'nearest',
-		// 				intersect: false,
-		// 				animation: false
-		// 			},
-		// 			annotation: getAnnotations()
-		// 		},
-		// 		scales: {
-		// 			x: {
-		// 				type: 'time',
-		// 				time: {
-		// 					tooltipFormat: 'HH:mm:ss',
-
-		// 					displayFormats: {
-		// 						millisecond: 'HH:mm:ss.S',
-		// 						second: 'HH:mm:ss',
-		// 						minute: 'HH:mm',
-		// 						hour: 'HH:mm'
-		// 					}
-		// 				},
-		// 				adapters: {
-		// 					date: {
-		// 						locale: nl
-		// 					}
-		// 				}
-		// 			},
-		// 			y: {
-		// 				min: 0
-		// 			}
-		// 		}
-		// 	},
-		// 	data: {
-		// 		labels: temperatureData.map((row) => row[0]),
-		// 		datasets: [
-		// 			{
-		// 				label: 'Temperature',
-		// 				data: temperatureData.map((row) => row[1]),
-		// 				fill: true,
-		// 				tension: 0.25
-		// 			}
-		// 		]
-		// 	}
-		// });
-
-		// if (import.meta.env.DEV) {
-		// 	// spoof some test data
-		// 	setInterval(() => {
-		// 		if (temperatureData.length > maxValues) {
-		// 			temperatureData.shift();
-		// 			relaisData.shift();
-		// 		}
-		// 		let d = new Date();
-
-		// 		if (temp < targetTemp / 2) {
-		// 			temp = temp + Math.random() * 0.5 - 0.125;
-		// 		} else if (temp < targetTemp / (3 / 2)) {
-		// 			temp = temp + Math.random() * 0.5 - 0.15;
-		// 		} else {
-		// 			temp = temp + Math.random() * 0.5 - 0.25;
-		// 		}
-
-		// 		let shootFactor = Math.min(
-		// 			((d.getTime() - lastSwitch.getTime()) / speedFactor -
-		// 				(lastSwitchDuration * 0.25) / speedFactor) /
-		// 				((3 * 60 * 1000) / speedFactor),
-		// 			1
-		// 		); // 5mins
-		// 		shootFactor = shootFactor;
-
-		// 		if (relais == 0) {
-		// 			temp = temp - 0.3 * shootFactor;
-		// 		} else {
-		// 			temp = temp + 0.3 * shootFactor;
-		// 		}
-
-		// 		let mod = temp % 0.25;
-		// 		if (mod > 0.125) {
-		// 			temp = temp - mod + 0.25;
-		// 		} else {
-		// 			temp = temp - mod;
-		// 		}
-
-		// 		let derivedShootFactor = Math.min(
-		// 			(d.getTime() - lastSwitch.getTime()) / speedFactor / ((3 * 60 * 1000) / speedFactor),
-		// 			1
-		// 		); // 5mins
-
-		// 		let overshoot = setOverShoot * derivedShootFactor; // derive over 5 mins -> 1 min eq. 3°C, 5mins eq. 15°C
-		// 		let dirivedOvershoot = Math.min(overshoot, setOverShoot);
-
-		// 		let undershoot = setUnderShoot * derivedShootFactor; // derive over 5 min -> 1 min eq. 3°C, 5mins eq. 15°C
-		// 		let dirivedUndershoot = Math.min(undershoot, setUnderShoot);
-
-		// 		targetTempOverShoot = targetTemp - dirivedOvershoot;
-		// 		targetTempUnderShoot = targetTemp + dirivedUndershoot;
-
-		// 		if (mode === 'auto_switch') {
-		// 			if (d.getTime() - lastSwitch.getTime() > switchDelay) {
-		// 				if (temp > targetTempOverShoot) {
-		// 					// > 270 °C
-		// 					if (relais == 1) {
-		// 						relais = 0;
-
-		// 						targetTempOverShoot = targetTemp;
-		// 						targetTempUnderShoot = targetTemp;
-		// 						lastSwitchDuration = d.getTime() - lastSwitch.getTime();
-		// 						lastSwitch = new Date();
-		// 					}
-		// 				}
-		// 			}
-		// 			if (d.getTime() - lastSwitch.getTime() > switchDelay) {
-		// 				if (temp < targetTempUnderShoot) {
-		// 					// < 310°C
-		// 					if (relais == 0) {
-		// 						relais = 1;
-
-		// 						targetTempOverShoot = targetTemp;
-		// 						targetTempUnderShoot = targetTemp;
-		// 						lastSwitchDuration = d.getTime() - lastSwitch.getTime();
-		// 						lastSwitch = new Date();
-		// 					}
-		// 				}
-		// 			}
-		// 		}
-
-		// 		if (mode === 'pwm') {
-		// 			if (d.getTime() - lastSwitch.getTime() > pwmOnDelay) {
-		// 				if (relais) {
-		// 					relais = 0;
-		// 					lastSwitch = new Date();
-		// 				}
-		// 			}
-		// 			if (d.getTime() - lastSwitch.getTime() > pwmOffDelay) {
-		// 				if (!relais) {
-		// 					relais = 1;
-		// 					lastSwitch = new Date();
-		// 				}
-		// 			}
-		// 		}
-
-		// 		temperatureData.push([d.getTime(), temp]);
-		// 		relaisData.push([d.getTime(), relais]);
-
-		// 		if (!pauseGraphUpdate) {
-		// 			chart.options.plugins.annotation = getAnnotations();
-		// 			chart.data.labels.push(d.getTime());
-		// 			chart.data.datasets.forEach((dataset) => {
-		// 				dataset.data.push(temp);
-		// 			});
-		// 			chart.update('none');
-		// 		}
-		// 	}, spoofInterval);
-		// }
 	});
 
-	const getReadings = () => {
-		ws.send('getReadings');
-	};
-
 	const initWebSocket = () => {
-		if (!import.meta.env.DEV) {
+		if (import.meta.env.DEV) {
+			console.log('DEV mode – using SpoofSocket');
+			// Destroy old spoof ticker before replacing
+			if (ws && 'destroy' in ws) (ws as unknown as SpoofSocket).destroy();
+			ws = new SpoofSocket() as unknown as WebSocket;
+		} else {
 			console.log('Trying to open a WebSocket connection…');
 			ws = new WebSocket(gateway);
-			ws.onopen = onOpen;
-			ws.onclose = onClose;
-			ws.onmessage = onMessage;
 		}
+		ws.onopen = () => {
+			console.log('Connection opened');
+			send('getReadings');
+		};
+		ws.onclose = () => {
+			console.log('Connection closed');
+			setTimeout(initWebSocket, 2000);
+		};
+		ws.onmessage = onMessage;
 	};
 
-	// When websocket is established, call the getReadings() function
-	const onOpen = () => {
-		console.log('Connection opened');
-		getReadings();
+	type SensorPayload = {
+		mode: string;
+		temperature: number;
+		relais: number;
+		target_temp: number;
+		pwm_on: number;
+		pwm_off: number;
+		pid: number;
+		kp: number;
+		ki: number;
+		kd: number;
 	};
 
-	const onClose = () => {
-		console.log('Connection closed');
-		setTimeout(initWebSocket, 2000);
-	};
-
-	// Function that receives the message from the ESP32 with the readings
 	const onMessage = (event: MessageEvent) => {
-		let myObj = JSON.parse(event.data);
-		let keys = Object.keys(myObj);
+		const data = JSON.parse(event.data) as SensorPayload;
 
-		for (var i = 0; i < keys.length; i++) {
-			let key = keys[i];
-			let element = document.getElementById(key);
-			if (element) {
-				element.innerHTML = myObj[key].toFixed(2);
-			}
-			let d = new Date();
-			if (key === 'temperature') {
-				if (temperatureData.length > maxValues) {
-					temperatureData.shift();
-				}
-				temp = myObj[key];
-				temperatureData.push([d.getTime(), temp]);
-			} else if (key === 'relais') {
-				if (relaisData.length > maxValues) {
-					relaisData.shift();
-				}
-				if (myObj[key]) {
-					relais = 1;
-				} else {
-					relais = 0;
-				}
-				relaisData.push([d.getTime(), relais]);
-			} else if (key === 'target_temp') {
-				targetTemp = myObj[key];
-			} else if (key === 'pid') {
-				if (powerData.length > maxValues) {
-					powerData.shift();
-				}
-				calculatedPidOutput = myObj[key];
-				powerData.push([d.getTime(), calculatedPidOutput]);
-			} else if (key === 'pwm_on') {
-				pwmOn = Number(myObj[key]) / 1000;
-			} else if (key === 'pwm_off') {
-				pwmOff = Number(myObj[key]) / 1000;
-			} else if (key === 'kp') {
-				kp = Number(myObj[key]);
-			} else if (key === 'ki') {
-				ki = Number(myObj[key]);
-			} else if (key === 'kd') {
-				kd = Number(myObj[key]);
-			} else if (key === 'mode') {
-				mode = myObj[key];
-				modeSpan.innerText = mode;
+		mode = data.mode;
+		temp = data.temperature;
+		relais = data.relais;
+		targetTemp = data.target_temp;
+		pwmOn = data.pwm_on / 1000;
+		pwmOff = data.pwm_off / 1000;
+		calculatedPidOutput = data.pid;
+		kp = data.kp;
+		ki = data.ki;
+		kd = data.kd;
+
+		const now = Date.now();
+
+		if (temperatureData.length >= MAX_STORED) temperatureData.shift();
+		temperatureData.push([now, temp]);
+		if (relaisData.length >= MAX_STORED) relaisData.shift();
+		relaisData.push([now, relais]);
+		if (powerData.length >= MAX_STORED) powerData.shift();
+		powerData.push([now, calculatedPidOutput]);
+
+		if (!pauseGraphUpdate && chart) {
+			const tempSeries = chart.data.datasets[0].data as { x: number; y: number }[];
+			const targetSeries = chart.data.datasets[1].data as { x: number; y: number }[];
+			const relaySeries = chart.data.datasets[2].data as { x: number; y: number }[];
+
+			tempSeries.push({ x: now, y: temp });
+			targetSeries.push({ x: now, y: targetTemp });
+			relaySeries.push({ x: now, y: data.relais });
+
+			if (tempSeries.length > CHART_WINDOW) {
+				tempSeries.shift();
+				targetSeries.shift();
+				relaySeries.shift();
 			}
 
-			// if (!pauseGraphUpdate) {
-			// 	chart.options.plugins.annotation = getAnnotations();
-			// 	chart.data.labels.push(d.getTime());
-			// 	chart.data.datasets.forEach((dataset) => {
-			// 		dataset.data.push(temp);
-			// 	});
-			// 	chart.update('none');
-			// }
+			chart.update('none');
 		}
 	};
 
-	const switchRelais = () => {
-		console.log('Send switch relais');
-		if (!import.meta.env.DEV) {
-			ws.send('switchRelais');
-		} else {
-			// spoof some test data
-			let d = new Date();
-			lastSwitchDuration = d.getTime() - lastSwitch.getTime();
-			lastSwitch = new Date();
-			if (!relais) {
-				relais = 1;
-			} else {
-				relais = 0;
-			}
-		}
-	};
+	const switchRelais = () => send('switchRelais');
 
 	const changeTargetTemp = (e: Event) => {
-		const target = e.target as HTMLTextAreaElement;
-		let value = Number(target?.value);
-		console.log('Changed target temp to ' + value);
-		if (!import.meta.env.DEV) {
-			ws.send('setTargetTemp: ' + pad(value, 3));
-		} else {
-			targetTemp = value;
-		}
+		const value = Number((e.target as HTMLInputElement).value);
+		send('setTargetTemp', value);
 	};
 
 	const changePwmOn = (e: Event) => {
-		const target = e.target as HTMLTextAreaElement;
-		let value = Number(target?.value);
-		console.log('Changed pwm on to ' + value);
+		const value = Number((e.target as HTMLInputElement).value);
 		pwmOn = value;
-		if (!import.meta.env.DEV) {
-			ws.send('setPWMOn: ' + pad(value, 3));
-		} else {
-			pwmOnDelay = (value / speedFactor) * 1000;
-		}
+		send('setPWMOn', value);
 	};
 
 	const changePwmOff = (e: Event) => {
-		const target = e.target as HTMLTextAreaElement;
-		let value = Number(target?.value);
-		console.log('Changed pwm off to ' + value);
+		const value = Number((e.target as HTMLInputElement).value);
 		pwmOff = value;
-		if (!import.meta.env.DEV) {
-			ws.send('setPWMOff: ' + pad(value, 3));
-		} else {
-			pwmOffDelay = (value / speedFactor) * 1000;
-		}
+		send('setPWMOff', value);
 	};
 
 	const changeMode = (e: Event) => {
-		const target = e.target as HTMLTextAreaElement;
-		let value = target?.value;
-		console.log('Mode set to ' + value);
-		if (!import.meta.env.DEV) {
-			ws.send('setMode: ' + value);
-		} else {
-			mode = value;
-			modeSpan.innerText = value;
-		}
+		send('setMode', (e.target as HTMLSelectElement).value);
 	};
 
 	const changeKValue = (e: Event, k: string) => {
-		const target = e.target as HTMLTextAreaElement;
-		let value = target?.value;
-		console.log('K' + k + ': ' + value);
-		if (!import.meta.env.DEV) {
-			ws.send(`setK${k}: ` + value);
-		} else {
-		}
+		const value = Number((e.target as HTMLInputElement).value);
+		send(`setK${k}`, value);
 	};
 
 	const prepareDownloadCSV = () => {
 		let csvContent = 'Time,Temp,Relais,Power\n';
-
-		for (let [i, temp] of temperatureData.entries()) {
-			csvContent += `${temp[0]},${temp[1]},${relaisData[i] ? relaisData[i][1] : ''},${powerData[i][1]}\n`;
+		for (let [i, row] of temperatureData.entries()) {
+			csvContent += `${row[0]},${row[1]},${relaisData[i]?.[1] ?? ''},${powerData[i]?.[1] ?? ''}\n`;
 		}
-
 		const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8,' });
 		const objUrl = URL.createObjectURL(blob);
 		if (downloadCSVButton) {
@@ -466,51 +357,82 @@
 </script>
 
 <div class="nav">
-	<div class="nav-title">CrustCraft</div>
+	<div class="nav-title">🍕 CrustCraft</div>
+	<button
+		class="dark-mode-btn"
+		onclick={() => (darkMode = !darkMode)}
+		aria-label="Toggle dark mode"
+	>
+		{#if darkMode}
+			<Sun size={18} />
+		{:else}
+			<Moon size={18} />
+		{/if}
+	</button>
 </div>
+
 <div class="content">
+	<!-- Status row -->
 	<div class="card-grid">
 		<div class="card">
-			<p class="card-title">Sensor Temperature</p>
-			<p class="reading">{temp.toFixed(2)} &deg;C</p>
+			<p class="card-label">Temperature</p>
+			<p
+				class="card-value {tempIsExtreme(temp) ? 'temp-extreme' : ''}"
+				style:color={tempIsExtreme(temp) ? undefined : tempColor(temp)}
+			>
+				{temp.toFixed(1)}<span class="card-unit">°C</span>
+			</p>
+			<p class="card-target">⌖ {targetTemp}°C</p>
 		</div>
-		<button class="card relais" onclick={switchRelais}>
-			<p>Relais</p>
-			<div class="onoffswitch">
+
+		<button class="card relay-card {relais ? 'relay-on' : 'relay-off'}" onclick={switchRelais}>
+			<p class="card-label">Relay</p>
+			<div class="onoffswitch" aria-hidden="true">
 				<input
 					type="checkbox"
-					name="onoffswitch"
-					class="onoffswitch-checkbox h-0"
-					id="relais_switch_input"
-					tabindex="0"
+					class="onoffswitch-checkbox"
+					id="relay_toggle"
 					checked={relais === 1}
+					tabindex="-1"
+					readonly
 				/>
-				<label class="onoffswitch-label" for="relais_switch_input">
+				<label class="onoffswitch-label" for="relay_toggle">
 					<span class="onoffswitch-inner"></span>
 					<span class="onoffswitch-switch"></span>
 				</label>
 			</div>
+			<p class="card-sub">tap to toggle</p>
 		</button>
+
+		<div class="card">
+			<p class="card-label">PID Output</p>
+			<p class="card-value">{calculatedPidOutput.toFixed(0)}<span class="card-unit">%</span></p>
+			<p class="card-sub">{(calculatedPidOutput * 12).toFixed(0)} W</p>
+		</div>
 	</div>
-	<div class="oven {relais ? 'on' : ''}" id="oven">
+
+	<!-- Oven graphic -->
+	<div class="oven {relais ? 'on' : ''}">
 		<div class="oven-wrapper">
 			<div class="oven-img-wrapper">
 				<img src="/oven_small.png" alt="Oven" />
 			</div>
 		</div>
 	</div>
-	<div class="graph">
-		<div class="plot-wrapper w-[800px]">
-			<div id="plot"></div>
-			<canvas bind:this={canvas} id="crusty"></canvas>
-		</div>
+
+	<!-- Chart -->
+	<div class="chart-section">
+		<canvas bind:this={canvas} id="crusty"></canvas>
 	</div>
-	<div class="card-grid settings">
-		<div class="card">
-			<p class="card-title">Target temperature</p>
-			<p class="reading">
+
+	<!-- Controls -->
+	<div class="controls-grid">
+		<!-- Target temp -->
+		<div class="card control-card">
+			<p class="card-label">Target Temperature</p>
+			<div class="input-row">
 				<input
-					class="min-w-[88px] rounded"
+					class="num-input"
 					type="number"
 					min="0"
 					max="600"
@@ -518,118 +440,103 @@
 					id="target_temperature"
 					onchange={changeTargetTemp}
 				/>
-				<label for="target_temperature"> &deg;C </label>
-			</p>
+				<span class="input-unit">°C</span>
+			</div>
 		</div>
-		<div class="card">
-			<p class="card-title">
-				Mode: <span bind:this={modeSpan} class="mode" id="mode_span">Manual</span>
-			</p>
-			<p class="reading">
-				<select class="rounded" name="modes" id="mode_selector" onchange={changeMode}>
-					<option value="auto_switch">Auto Switch</option>
-					<option value="pwm">PWM</option>
-					<option value="pid">PID</option>
-					<option value="off" selected>Manual</option>
-				</select>
-			</p>
-			{#if mode === 'pwm'}
-				<div class="mt-2 flex items-center gap-15">
-					<div>on</div>
-					<div>off</div>
-				</div>
 
-				<div class="mt-2 flex items-center gap-1">
-					<input
-						class="min-w-[65px] rounded"
-						type="number"
-						min="0"
-						max="120"
-						bind:value={pwmOn}
-						id="pwm_on"
-						onchange={changePwmOn}
-					/>
-					<label for="pwm_on"> s </label>
-					<input
-						class="min-w-[65px] rounded"
-						type="number"
-						min="0"
-						max="120"
-						bind:value={pwmOff}
-						id="pwm_off"
-						onchange={changePwmOff}
-					/>
-					<label for="pwm_off"> s </label>
+		<!-- Mode -->
+		<div class="card control-card">
+			<p class="card-label">Mode</p>
+			<select class="mode-select" name="modes" id="mode_selector" onchange={changeMode}>
+				<option value="pwm">PWM</option>
+				<option value="pid">PID</option>
+				<option value="manual" selected>Manual</option>
+			</select>
+
+			{#if mode === 'pwm'}
+				<div class="subcontrol-grid mt-3">
+					<div class="subcontrol">
+						<label class="sublabel" for="pwm_on">ON</label>
+						<div class="input-row">
+							<input
+								class="num-input"
+								type="number"
+								min="0"
+								max="120"
+								bind:value={pwmOn}
+								id="pwm_on"
+								onchange={changePwmOn}
+							/>
+							<span class="input-unit">s</span>
+						</div>
+					</div>
+					<div class="subcontrol">
+						<label class="sublabel" for="pwm_off">OFF</label>
+						<div class="input-row">
+							<input
+								class="num-input"
+								type="number"
+								min="0"
+								max="120"
+								bind:value={pwmOff}
+								id="pwm_off"
+								onchange={changePwmOff}
+							/>
+							<span class="input-unit">s</span>
+						</div>
+					</div>
 				</div>
-				<div class="mt-3 flex items-center gap-1">
-					{((pwmOn / (pwmOn + pwmOff)) * 100).toFixed(0)}%, {(
+				<p class="subinfo mt-2">
+					Duty {((pwmOn / (pwmOn + pwmOff)) * 100).toFixed(0)}% &mdash; {(
 						(pwmOn / (pwmOn + pwmOff)) *
 						1200
-					).toFixed(0)}W
-				</div>
+					).toFixed(0)} W
+				</p>
 			{/if}
+
 			{#if mode === 'pid'}
-				<div class="mt-3 flex items-center gap-1">
-					PID: {calculatedPidOutput ? calculatedPidOutput.toFixed(0) : 0}% {calculatedPidOutput
-						? (calculatedPidOutput * 12).toFixed(0)
-						: 0}W
-				</div>
-				<div>ON:{pwmOn.toFixed(2)}s OFF:{pwmOff ? pwmOff.toFixed(2) : 0}s</div>
-				<div class="mt-3 flex w-full justify-between px-13">
-					<div>Kp</div>
-					<div>Ki</div>
-					<!-- <div>Kd</div> -->
-				</div>
-				<div class="flex gap-1">
-					<input
-						class="min-w-[120px] rounded"
-						type="number"
-						min="0"
-						max="50"
-						step="0.1"
-						value={kp}
-						id="target_temperature"
-						onchange={(e) => changeKValue(e, 'p')}
-					/>
-					<input
-						class="min-w-[120px] rounded"
-						type="number"
-						min="0"
-						max="50"
-						step="0.1"
-						value={ki}
-						id="target_temperature"
-						onchange={(e) => changeKValue(e, 'i')}
-					/>
-					<!-- <input
-						class="min-w-[85px] rounded"
-						type="number"
-						min="0"
-						max="50"
-						step="0.1"
-						value={kd}
-						id="target_temperature"
-						onchange={(e) => changeKValue(e, 'd')}
-					/> -->
+				<p class="subinfo mt-3">
+					ON {pwmOn.toFixed(2)} s &nbsp;/&nbsp; OFF {pwmOff ? pwmOff.toFixed(2) : 0} s
+				</p>
+				<div class="subcontrol-grid mt-3">
+					<div class="subcontrol">
+						<label class="sublabel" for="kp">Kp</label>
+						<input
+							class="num-input"
+							type="number"
+							min="0"
+							max="50"
+							step="0.1"
+							value={kp}
+							id="kp"
+							onchange={(e) => changeKValue(e, 'p')}
+						/>
+					</div>
+					<div class="subcontrol">
+						<label class="sublabel" for="ki">Ki</label>
+						<input
+							class="num-input"
+							type="number"
+							min="0"
+							max="50"
+							step="0.1"
+							value={ki}
+							id="ki"
+							onchange={(e) => changeKValue(e, 'i')}
+						/>
+					</div>
 				</div>
 			{/if}
 		</div>
-		<div class="card flex cursor-pointer gap-2">
-			<button
-				class="cursor-pointer rounded border p-2"
-				onclick={() => (pauseGraphUpdate = !pauseGraphUpdate)}
-				>{pauseGraphUpdate ? 'Resume' : 'Pause'} Graph</button
-			>
-			<button
-				class="cursor-pointer rounded border p-2"
-				id="prepare_download"
-				onclick={prepareDownloadCSV}>Prepare Download</button
-			>
-			<a
-				bind:this={downloadCSVButton}
-				class="hidden cursor-pointer rounded border p-2"
-				id="download_csv">Download CSV</a
-			>
+
+		<!-- Data actions -->
+		<div class="card control-card gap-2">
+			<p class="card-label">Data</p>
+			<button class="action-btn" onclick={() => (pauseGraphUpdate = !pauseGraphUpdate)}>
+				{pauseGraphUpdate ? '▶ Resume' : '⏸ Pause'}
+			</button>
+			<button class="action-btn" onclick={prepareDownloadCSV}> ⬇ Export CSV </button>
+			<a bind:this={downloadCSVButton} class="action-btn hidden" id="download_csv"> 💾 Download </a>
 		</div>
 	</div>
 </div>

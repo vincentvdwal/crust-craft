@@ -70,7 +70,7 @@ export class SpoofSocket {
 		pwm_off: 4000,
 		pid: 0,
 		kp: 0.6,
-		ki: 0.1,
+		ki: 0.03,
 		kd: 0.0,
 		bake_phase: '',
 		bake_remaining: 0
@@ -127,14 +127,16 @@ export class SpoofSocket {
 
 	private applyMode(m: string): void {
 		const s = this.s;
+		const wasPid = this.isPidMode(s.mode);
 		s.mode = m;
 		if (m === 'baking') this.bakeStart = Date.now();
 		if (m === 'manual') {
 			s.relais = 0;
 			this.lastSwitch = Date.now();
 		}
-		// Dump windup when the new target is below the current temp (e.g. -> pause)
-		if (this.isPidMode(m) && this.activeSetpoint() < s.temperature) this.integral = 0;
+		// Reset integral arriving from a non-PID mode (stale value) or when the
+		// new target is below the current temp (mirrors firmware applyMode).
+		if (this.isPidMode(m) && (!wasPid || this.activeSetpoint() < s.temperature)) this.integral = 0;
 	}
 
 	private handle(cmd: string, value?: number | string): void {
@@ -208,7 +210,8 @@ export class SpoofSocket {
 			const satHigh = output >= 100 && error > 0;
 			const satLow = output <= 0 && error < 0;
 			if (!satHigh && !satLow) {
-				this.integral = Math.max(-100, Math.min(100, this.integral + s.ki * error * dt));
+				// integral clamped to ±70 to match the firmware (anti-overshoot)
+				this.integral = Math.max(-70, Math.min(70, this.integral + s.ki * error * dt));
 			}
 			output = Math.max(0, Math.min(100, pTerm + this.integral));
 			s.pid = output;

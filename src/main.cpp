@@ -27,7 +27,7 @@ unsigned long lastWebSocket = 0;
 const unsigned long WS_INTERVAL = 500;
 
 float temperature = 0;
-float targetTemp = 370.0f; // default target temp for preheating, adjustable via UI
+float targetTemp = 350.0f; // default target temp for preheating, adjustable via UI
 
 unsigned long lastSwitch = 0;
 float pwmSwitchDelayOn = 2000;  // 2s
@@ -35,8 +35,8 @@ float pwmSwitchDelayOff = 4000; // 4s
 
 float power = 100;
 
-float kp = 0.55;
-float ki = 0.005;
+float kp = 0.6;
+float ki = 0.03;
 float kd = 0.0;
 
 // Heating modes. PREHEAT, PAUSE and BAKING are all PI-regulated and only
@@ -55,7 +55,11 @@ unsigned long bakeStart = 0; // millis() when BAKING was entered
 
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
-PIDController pid(kp, ki, kd, 100.0, 0.0, 100.0); // Kp, Ki, Kd, max, min, max_integral
+// integral capped at 70 (not 100): near the setpoint P≈0, so the integral alone
+// supplies the holding power. Letting it reach 100 means full power right as we
+// hit the setpoint → big overshoot on this high-lag oven. 70 still covers the
+// steady-state duty needed at high setpoints.
+PIDController pid(kp, ki, kd, 100.0, 0.0, 70.0); // Kp, Ki, Kd, max, min, max_integral
 
 static const char *modeToStr(Mode m)
 {
@@ -96,6 +100,7 @@ static float activeSetpoint()
 // Centralised mode switch so every entry point stays consistent and safe.
 static void applyMode(Mode m)
 {
+  Mode prev = mode;
   mode = m;
 
   if (m == Mode::BAKING)
@@ -110,9 +115,12 @@ static void applyMode(Mode m)
   if (isPidMode(m))
   {
     pid.setSetpoint(activeSetpoint());
-    // Dump integral windup when the new target is below the current temp
-    // (e.g. PREHEAT -> PAUSE) so we don't keep heating into an overshoot.
-    if (activeSetpoint() < temperature)
+    // Reset the integral when arriving from a non-PID mode (its value is stale
+    // and would dump straight into an overshoot) or when the new target is
+    // below the current temp (e.g. PREHEAT -> PAUSE, or BAKING -> PREHEAT).
+    // A PID -> PID hand-off at a higher target (e.g. PREHEAT -> BAKING) keeps
+    // the integral so the boost adds to the existing holding power.
+    if (!isPidMode(prev) || activeSetpoint() < temperature)
       pid.reset();
   }
 

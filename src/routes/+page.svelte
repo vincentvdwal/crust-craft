@@ -49,7 +49,7 @@
 	let pwmOff = $state(4);
 
 	let kp = $state(0.6);
-	let ki = $state(0.1);
+	let ki = $state(0.03);
 
 	let pauseGraphUpdate = $state(false);
 	let darkMode = $state(true);

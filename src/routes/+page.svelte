@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { SpoofSocket } from '$lib/spoof';
+	import { pad } from '$lib/utils';
 	import { Sun, Moon } from 'lucide-svelte';
 	import {
 		Chart,
@@ -34,41 +35,76 @@
 	let gateway = `ws://${page.url.host}/ws`;
 	let ws: WebSocket;
 
-	let mode = $state('manual');
+	let mode = $state('preheat');
 	let temp = $state(0);
 	let relais = $state(0);
 	let targetTemp = $state(460);
 	let calculatedPidOutput = $state(0);
+	let bakeRemaining = $state(0);
+	let bakePhase = $state('');
+	let pauseTemp = $state(275);
+	let bakeBoost = $state(40);
 
 	let pwmOn = $state(2);
 	let pwmOff = $state(4);
 
 	let kp = $state(0.6);
 	let ki = $state(0.1);
-	let kd = $state(0.0);
 
 	let pauseGraphUpdate = $state(false);
 	let darkMode = $state(true);
+
+	// ── Modes ──────────────────────────────────────────────
+	// Preheat / Pause / Baking are all PI-regulated on the firmware; they only
+	// differ in the setpoint. Manual = hand control, PWM = fixed duty cycle.
+	// pauseTemp / bakeBoost are adjustable and come from the firmware.
+	type ModeMeta = { id: string; label: string; icon: string; color: string };
+	const MODES: ModeMeta[] = [
+		{ id: 'preheat', label: 'Preheat', icon: '🔥', color: '#f97316' },
+		{ id: 'baking', label: 'Baking', icon: '🍕', color: '#ef4444' },
+		{ id: 'pause', label: 'Pause', icon: '⏸', color: '#14b8a6' },
+		{ id: 'pwm', label: 'PWM', icon: '⎍', color: '#38bdf8' },
+		{ id: 'manual', label: 'Manual', icon: '✋', color: '#9ca3af' }
+	];
+	const modeMeta = $derived(MODES.find((m) => m.id === mode) ?? MODES[0]);
+	const isPidMode = $derived(mode === 'preheat' || mode === 'pause' || mode === 'baking');
+
+	// The temperature the oven is actually driving towards right now. null when
+	// it equals the user's target (Preheat / Manual / PWM).
+	const effectiveTarget = $derived(
+		mode === 'baking' ? targetTemp + bakeBoost : mode === 'pause' ? pauseTemp : null
+	);
+
+	// Paint the whole UI with the active mode's accent colour.
+	$effect(() => {
+		document.documentElement.style.setProperty('--mode-color', modeMeta.color);
+		document.documentElement.setAttribute('data-mode', mode);
+	});
+
+	const fmtMMSS = (s: number) => `${Math.floor(s / 60)}:${pad(s % 60)}`;
 
 	$effect(() => {
 		document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
 		if (chart) {
 			const tickColor = darkMode ? '#7a7f96' : '#6b7280';
 			const gridColor = darkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.07)';
-			(chart.options.scales!.x as any).ticks.color = tickColor;
-			(chart.options.scales!.x as any).grid.color = gridColor;
-			(chart.options.scales!.y as any).ticks.color = tickColor;
-			(chart.options.scales!.y as any).grid.color = gridColor;
+			type AxisStyle = { ticks: { color: string }; grid: { color: string } };
+			const x = chart.options.scales!.x as unknown as AxisStyle;
+			const y = chart.options.scales!.y as unknown as AxisStyle;
+			x.ticks.color = tickColor;
+			x.grid.color = gridColor;
+			y.ticks.color = tickColor;
+			y.grid.color = gridColor;
 			chart.update('none');
 		}
 	});
 
 	// Temperature colour / class helpers
 	const TEMP_ZONE_COLORS = [
-		{ max: 350, color: '#22c55e' },
-		{ max: 420, color: '#eab308' },
-		{ max: 480, color: '#f97316' },
-		{ max: 520, color: '#ef4444' }
+		{ max: 300, color: '#22c55e' },
+		{ max: 370, color: '#eab308' },
+		{ max: 430, color: '#f97316' },
+		{ max: 470, color: '#ef4444' }
 	] as const;
 
 	function tempColor(t: number): string {
@@ -76,7 +112,7 @@
 		return '#ef4444';
 	}
 	function tempIsExtreme(t: number): boolean {
-		return t >= 520;
+		return t >= 470;
 	}
 
 	// Custom Chart.js plugin that draws temperature zone bands behind the data
@@ -93,11 +129,11 @@
 			const width = right - left;
 
 			const zones = [
-				{ min: 0, max: 350, fill: 'rgba(34,197,94,0.07)', stripe: false },
-				{ min: 350, max: 420, fill: 'rgba(234,179,8,0.09)', stripe: false },
-				{ min: 420, max: 480, fill: 'rgba(249,115,22,0.10)', stripe: false },
-				{ min: 480, max: 520, fill: 'rgba(239,68,68,0.12)', stripe: false },
-				{ min: 520, max: 700, fill: 'rgba(239,68,68,0.06)', stripe: true }
+				{ min: 0, max: 300, fill: 'rgba(34,197,94,0.07)', stripe: false },
+				{ min: 300, max: 370, fill: 'rgba(234,179,8,0.09)', stripe: false },
+				{ min: 370, max: 430, fill: 'rgba(249,115,22,0.10)', stripe: false },
+				{ min: 430, max: 470, fill: 'rgba(239,68,68,0.12)', stripe: false },
+				{ min: 470, max: 700, fill: 'rgba(239,68,68,0.06)', stripe: true }
 			];
 			const labels = ['Low', 'Medium', 'High', 'Very High', 'Extreme'];
 
@@ -263,12 +299,16 @@
 		temperature: number;
 		relais: number;
 		target_temp: number;
+		pause_temp: number;
+		bake_boost: number;
 		pwm_on: number;
 		pwm_off: number;
 		pid: number;
 		kp: number;
 		ki: number;
 		kd: number;
+		bake_phase: string;
+		bake_remaining: number;
 	};
 
 	const onMessage = (event: MessageEvent) => {
@@ -283,7 +323,10 @@
 		calculatedPidOutput = data.pid;
 		kp = data.kp;
 		ki = data.ki;
-		kd = data.kd;
+		bakeRemaining = data.bake_remaining ?? 0;
+		bakePhase = data.bake_phase ?? '';
+		pauseTemp = data.pause_temp ?? pauseTemp;
+		bakeBoost = data.bake_boost ?? bakeBoost;
 
 		const now = Date.now();
 
@@ -320,6 +363,18 @@
 		send('setTargetTemp', value);
 	};
 
+	const changePauseTemp = (e: Event) => {
+		const value = Number((e.target as HTMLInputElement).value);
+		pauseTemp = value;
+		send('setPauseTemp', value);
+	};
+
+	const changeBakeBoost = (e: Event) => {
+		const value = Number((e.target as HTMLInputElement).value);
+		bakeBoost = value;
+		send('setBakeOffset', value);
+	};
+
 	const changePwmOn = (e: Event) => {
 		const value = Number((e.target as HTMLInputElement).value);
 		pwmOn = value;
@@ -332,9 +387,7 @@
 		send('setPWMOff', value);
 	};
 
-	const changeMode = (e: Event) => {
-		send('setMode', (e.target as HTMLSelectElement).value);
-	};
+	const setMode = (id: string) => send('setMode', id);
 
 	const changeKValue = (e: Event, k: string) => {
 		const value = Number((e.target as HTMLInputElement).value);
@@ -357,6 +410,11 @@
 </script>
 
 <div class="nav">
+	<div class="mode-pill">
+		<span class="mode-pill-dot"></span>
+		<span class="mode-pill-icon">{modeMeta.icon}</span>
+		<span class="mode-pill-label">{modeMeta.label}</span>
+	</div>
 	<div class="nav-title">🍕 CrustCraft</div>
 	<button
 		class="dark-mode-btn"
@@ -372,6 +430,29 @@
 </div>
 
 <div class="content">
+	<!-- Prominent bake countdown -->
+	{#if mode === 'baking'}
+		{#if bakePhase === 'wait'}
+			<div class="bake-banner bake-banner-wait">
+				<div class="bake-banner-head">
+					<span class="bake-banner-icon">⏳</span>
+					<span>WARMING UP · reaching {targetTemp + bakeBoost}°C</span>
+				</div>
+				<div class="bake-timer">{fmtMMSS(bakeRemaining)}</div>
+				<div class="bake-banner-sub">bake starts once the oven is ready</div>
+			</div>
+		{:else}
+			<div class="bake-banner">
+				<div class="bake-banner-head">
+					<span class="bake-banner-icon">🍕</span>
+					<span>BAKING · boost +{bakeBoost}°C → {targetTemp + bakeBoost}°C</span>
+				</div>
+				<div class="bake-timer">{fmtMMSS(bakeRemaining)}</div>
+				<div class="bake-banner-sub">returns to Preheat when the timer ends</div>
+			</div>
+		{/if}
+	{/if}
+
 	<!-- Status row -->
 	<div class="card-grid">
 		<div class="card">
@@ -382,7 +463,14 @@
 			>
 				{temp.toFixed(1)}<span class="card-unit">°C</span>
 			</p>
-			<p class="card-target">⌖ {targetTemp}°C</p>
+			{#if effectiveTarget !== null}
+				<p class="card-target">
+					<span class="target-old">{targetTemp}°C</span>
+					<span class="target-new">⌖ {effectiveTarget}°C</span>
+				</p>
+			{:else}
+				<p class="card-target">⌖ {targetTemp}°C</p>
+			{/if}
 		</div>
 
 		<button class="card relay-card {relais ? 'relay-on' : 'relay-off'}" onclick={switchRelais}>
@@ -447,11 +535,56 @@
 		<!-- Mode -->
 		<div class="card control-card">
 			<p class="card-label">Mode</p>
-			<select class="mode-select" name="modes" id="mode_selector" onchange={changeMode}>
-				<option value="pwm">PWM</option>
-				<option value="pid">PID</option>
-				<option value="manual" selected>Manual</option>
-			</select>
+			<div class="mode-btn-grid">
+				{#each MODES as m (m.id)}
+					<button
+						class="mode-btn {mode === m.id ? 'active' : ''}"
+						style:--mc={m.color}
+						onclick={() => setMode(m.id)}
+					>
+						<span class="mode-btn-icon">{m.icon}</span>
+						<span class="mode-btn-label">{m.label}</span>
+					</button>
+				{/each}
+			</div>
+
+			{#if mode === 'pause'}
+				<div class="subcontrol mt-3">
+					<label class="sublabel" for="pause_temp">Hold temp</label>
+					<div class="input-row">
+						<input
+							class="num-input"
+							type="number"
+							min="0"
+							max="600"
+							value={pauseTemp}
+							id="pause_temp"
+							onchange={changePauseTemp}
+						/>
+						<span class="input-unit">°C</span>
+					</div>
+				</div>
+			{/if}
+			{#if mode === 'baking'}
+				<div class="subcontrol mt-3">
+					<label class="sublabel" for="bake_boost">Boost offset</label>
+					<div class="input-row">
+						<input
+							class="num-input"
+							type="number"
+							min="0"
+							max="150"
+							value={bakeBoost}
+							id="bake_boost"
+							onchange={changeBakeBoost}
+						/>
+						<span class="input-unit">°C</span>
+					</div>
+				</div>
+				<p class="subinfo mt-2">
+					→ {targetTemp + bakeBoost}°C · 1 min warm-up + 3 min bake, then Preheat
+				</p>
+			{/if}
 
 			{#if mode === 'pwm'}
 				<div class="subcontrol-grid mt-3">
@@ -494,7 +627,7 @@
 				</p>
 			{/if}
 
-			{#if mode === 'pid'}
+			{#if isPidMode}
 				<p class="subinfo mt-3">
 					ON {pwmOn.toFixed(2)} s &nbsp;/&nbsp; OFF {pwmOff ? pwmOff.toFixed(2) : 0} s
 				</p>

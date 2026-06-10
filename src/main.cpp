@@ -39,8 +39,19 @@ float kp = 0.6;
 float ki = 0.1;
 float kd = 0.0;
 
-enum class Mode { MANUAL, PWM, PID };
-Mode mode = Mode::MANUAL;
+// Heating modes. PREHEAT, PAUSE and BAKING are all PI-regulated and only
+// differ in the setpoint they drive towards. The oven always boots in PREHEAT
+// (never MANUAL with the relay latched on).
+enum class Mode { MANUAL, PWM, PREHEAT, PAUSE, BAKING };
+Mode mode = Mode::PREHEAT;
+
+// Setpoints / timing for the PI-based modes (pauseTemp / bakeBoost are UI-adjustable)
+float pauseTemp = 275.0f;                                   // low "keep-warm" hold
+float bakeBoost = 40.0f;                                    // °C added on top of target
+constexpr unsigned long BAKE_WAIT_MS = 60UL * 1000;         // 1 min warm-up before baking
+constexpr unsigned long BAKE_DURATION_MS = 3UL * 60 * 1000; // 3 min bake, then -> PREHEAT
+
+unsigned long bakeStart = 0; // millis() when BAKING was entered
 
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
@@ -52,11 +63,60 @@ static const char *modeToStr(Mode m)
   {
   case Mode::PWM:
     return "pwm";
-  case Mode::PID:
-    return "pid";
+  case Mode::PREHEAT:
+    return "preheat";
+  case Mode::PAUSE:
+    return "pause";
+  case Mode::BAKING:
+    return "baking";
   default:
     return "manual";
   }
+}
+
+static bool isPidMode(Mode m)
+{
+  return m == Mode::PREHEAT || m == Mode::PAUSE || m == Mode::BAKING;
+}
+
+// Effective setpoint the PI controller drives towards for the current mode.
+static float activeSetpoint()
+{
+  switch (mode)
+  {
+  case Mode::PAUSE:
+    return pauseTemp;
+  case Mode::BAKING:
+    return targetTemp + bakeBoost;
+  default: // PREHEAT (and any other PI mode)
+    return targetTemp;
+  }
+}
+
+// Centralised mode switch so every entry point stays consistent and safe.
+static void applyMode(Mode m)
+{
+  mode = m;
+
+  if (m == Mode::BAKING)
+    bakeStart = millis();
+
+  if (m == Mode::MANUAL)
+  {
+    digitalWrite(relay, LOW); // never leave MANUAL with the relay latched on
+    lastSwitch = millis();
+  }
+
+  if (isPidMode(m))
+  {
+    pid.setSetpoint(activeSetpoint());
+    // Dump integral windup when the new target is below the current temp
+    // (e.g. PREHEAT -> PAUSE) so we don't keep heating into an overshoot.
+    if (activeSetpoint() < temperature)
+      pid.reset();
+  }
+
+  Serial.printf("\nMode set to %s", modeToStr(mode));
 }
 
 // Get Sensor Readings and return JSON object
@@ -73,6 +133,8 @@ String getSensorReadings()
   readings["relais"] = digitalRead(relay) == HIGH ? 1 : 0;
 
   readings["target_temp"] = targetTemp;
+  readings["pause_temp"] = pauseTemp;
+  readings["bake_boost"] = bakeBoost;
 
   readings["pwm_on"] = pwmSwitchDelayOn;
   readings["pwm_off"] = pwmSwitchDelayOff;
@@ -82,6 +144,28 @@ String getSensorReadings()
   readings["kp"] = kp;
   readings["ki"] = ki;
   readings["kd"] = kd;
+
+  // Baking runs in two phases: a "wait" warm-up, then the actual "bake".
+  // Report the current phase and the seconds left within that phase.
+  const char *bakePhase = "";
+  unsigned long bakeRemaining = 0;
+  if (mode == Mode::BAKING)
+  {
+    unsigned long elapsed = millis() - bakeStart;
+    if (elapsed < BAKE_WAIT_MS)
+    {
+      bakePhase = "wait";
+      bakeRemaining = (BAKE_WAIT_MS - elapsed) / 1000;
+    }
+    else
+    {
+      bakePhase = "bake";
+      unsigned long total = BAKE_WAIT_MS + BAKE_DURATION_MS;
+      bakeRemaining = elapsed >= total ? 0 : (total - elapsed) / 1000;
+    }
+  }
+  readings["bake_phase"] = bakePhase;
+  readings["bake_remaining"] = bakeRemaining;
 
   serializeJson(readings, jsonString);
   return jsonString;
@@ -152,43 +236,49 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
     }
     else if (strcmp(cmd, "switchRelais") == 0)
     {
+      // Manual override: tapping the relay drops into MANUAL and toggles it.
       Serial.printf("\nSwitch Relais");
-      if (digitalRead(relay) == HIGH)
-      {
-        digitalWrite(relay, LOW);
-        lastSwitch = millis();
-        mode = Mode::MANUAL;
-      }
-      else
-      {
-        digitalWrite(relay, HIGH);
-        lastSwitch = millis();
-      }
+      bool turnOn = digitalRead(relay) != HIGH;
+      mode = Mode::MANUAL;
+      digitalWrite(relay, turnOn ? HIGH : LOW);
+      lastSwitch = millis();
     }
     else if (strcmp(cmd, "setTargetTemp") == 0)
     {
-      targetTemp = doc["value"].as<float>();
-      pid.setSetpoint(targetTemp);
+      float value = doc["value"].as<float>();
+      targetTemp = constrain(value, 0.0f, 600.0f); // clamp to the UI's range
+      pid.setSetpoint(activeSetpoint());            // respects the BAKING boost
       Serial.printf("\nTarget temp set to %.1f°C", targetTemp);
+    }
+    else if (strcmp(cmd, "setPauseTemp") == 0)
+    {
+      pauseTemp = constrain(doc["value"].as<float>(), 0.0f, 600.0f);
+      if (isPidMode(mode))
+        pid.setSetpoint(activeSetpoint());
+      Serial.printf("\nPause temp set to %.1f°C", pauseTemp);
+    }
+    else if (strcmp(cmd, "setBakeOffset") == 0)
+    {
+      bakeBoost = constrain(doc["value"].as<float>(), 0.0f, 150.0f);
+      if (isPidMode(mode))
+        pid.setSetpoint(activeSetpoint());
+      Serial.printf("\nBake offset set to %.1f°C", bakeBoost);
     }
     else if (strcmp(cmd, "setMode") == 0)
     {
       const char *value = doc["value"];
-      if (value && strcmp(value, "pwm") == 0)
-      {
-        mode = Mode::PWM;
-      }
-      else if (value && strcmp(value, "pid") == 0)
-      {
-        mode = Mode::PID;
-      }
+      if (!value)
+        return;
+      if (strcmp(value, "pwm") == 0)
+        applyMode(Mode::PWM);
+      else if (strcmp(value, "preheat") == 0)
+        applyMode(Mode::PREHEAT);
+      else if (strcmp(value, "pause") == 0)
+        applyMode(Mode::PAUSE);
+      else if (strcmp(value, "baking") == 0)
+        applyMode(Mode::BAKING);
       else
-      {
-        mode = Mode::MANUAL;
-        digitalWrite(relay, LOW);
-        lastSwitch = millis();
-      }
-      Serial.printf("\nMode set to %s", modeToStr(mode));
+        applyMode(Mode::MANUAL);
     }
     else if (strcmp(cmd, "setKp") == 0)
     {
@@ -243,67 +333,68 @@ void initWebSocket()
   server.addHandler(&ws);
 }
 
+// Translate a 0-100% PI output into relay switching with a fixed on-time and a
+// computed off-time. Handles the saturation cases explicitly so the relay is
+// never left in the wrong state (the old code could get stuck OFF at 100%).
+void applyPidRelay(float pwr)
+{
+  if (pwr >= 100.0f)
+  {
+    pwmSwitchDelayOff = 0.0f; // full power: keep the relay on continuously
+    if (digitalRead(relay) != HIGH)
+      digitalWrite(relay, HIGH);
+    return;
+  }
+  if (pwr <= 0.0f)
+  {
+    pwmSwitchDelayOff = 0.0f; // no power: relay off
+    if (digitalRead(relay) != LOW)
+      digitalWrite(relay, LOW);
+    return;
+  }
+
+  pwmSwitchDelayOff = (pwmSwitchDelayOn / (pwr / 100.0f)) - pwmSwitchDelayOn;
+
+  unsigned long elapsed = millis() - lastSwitch;
+  if (digitalRead(relay) == HIGH && elapsed > pwmSwitchDelayOn)
+  {
+    digitalWrite(relay, LOW);
+    lastSwitch = millis();
+  }
+  else if (digitalRead(relay) == LOW && elapsed > pwmSwitchDelayOff)
+  {
+    digitalWrite(relay, HIGH);
+    lastSwitch = millis();
+  }
+}
+
 void regulateRelais()
 {
   if (mode == Mode::PWM)
   {
-    if ((millis() - lastSwitch) > pwmSwitchDelayOn)
+    unsigned long elapsed = millis() - lastSwitch;
+    if (digitalRead(relay) == HIGH && elapsed > pwmSwitchDelayOn)
     {
-      if (digitalRead(relay) == HIGH)
-      {
-        digitalWrite(relay, LOW);
-        lastSwitch = millis();
-      }
-    }
-
-    if ((millis() - lastSwitch) > pwmSwitchDelayOff)
-    {
-      if (digitalRead(relay) == LOW)
-      {
-        digitalWrite(relay, HIGH);
-        lastSwitch = millis();
-      }
-    }
-  }
-  if (mode == Mode::PID)
-  {
-    // output = Kp×error + Ki×∫error×dt + Kd×(Δerror/Δt)
-    power = pid.compute(temperature);
-    if (power > 0.0f)
-    {
-      pwmSwitchDelayOff = (pwmSwitchDelayOn / (power / 100.0f)) - pwmSwitchDelayOn;
-    }
-    else
-    {
-      pwmSwitchDelayOff = 0.0f;
       digitalWrite(relay, LOW);
       lastSwitch = millis();
     }
-
-    if (pwmSwitchDelayOff > 0)
+    else if (digitalRead(relay) == LOW && elapsed > pwmSwitchDelayOff)
     {
-      if ((millis() - lastSwitch) > pwmSwitchDelayOn)
-      {
-        if (digitalRead(relay) == HIGH)
-        {
-          digitalWrite(relay, LOW);
-          lastSwitch = millis();
-        }
-      }
+      digitalWrite(relay, HIGH);
+      lastSwitch = millis();
     }
+    return;
+  }
 
-    if (pwmSwitchDelayOff > 0)
-    {
+  if (isPidMode(mode))
+  {
+    // Baking = 1 min warm-up + 3 min bake; when it's done, return to PREHEAT.
+    if (mode == Mode::BAKING && (millis() - bakeStart) >= (BAKE_WAIT_MS + BAKE_DURATION_MS))
+      applyMode(Mode::PREHEAT);
 
-      if ((millis() - lastSwitch) > pwmSwitchDelayOff)
-      {
-        if (digitalRead(relay) == LOW)
-        {
-          digitalWrite(relay, HIGH);
-          lastSwitch = millis();
-        }
-      }
-    }
+    pid.setSetpoint(activeSetpoint()); // track target / boost / pause changes
+    power = pid.compute(temperature);
+    applyPidRelay(power);
   }
 }
 
@@ -311,12 +402,11 @@ void setup()
 {
   Serial.begin(9600);
   pinMode(relay, OUTPUT);
+  digitalWrite(relay, LOW); // boot with heating OFF; the PI loop drives the relay
 
   initWiFi();
   initLittleFS();
   initWebSocket();
-
-  digitalWrite(relay, HIGH);
 
   // Web Server Root URL
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -324,9 +414,12 @@ void setup()
 
   server.serveStatic("/", LittleFS, "/");
 
-  // Create PID controller instance
+  // Create PID controller instance.
+  // NOTE: SENSOR_INTERVAL / 1000 is integer division (100/1000 == 0), which set
+  // dt to 0 and silently disabled the integral term — that was the real cause
+  // of the steady-state offset (curve flat-lining well below the setpoint).
   pid.setSetpoint(targetTemp);
-  pid.setDt(SENSOR_INTERVAL / 1000);
+  pid.setDt(SENSOR_INTERVAL / 1000.0f); // 0.1 s
 
   ElegantOTA.begin(&server);
 

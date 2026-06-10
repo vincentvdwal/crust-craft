@@ -8,13 +8,19 @@
  *   – Newton's law of cooling when relay is off.
  *   – Small Gaussian noise on each tick for realism.
  *
- * Control modes mirror the firmware: manual, pwm, pid.
+ * Control modes mirror the firmware: manual, pwm, preheat, pause, baking.
  */
 
 const TICK_MS = 500; // matches WS_INTERVAL on the firmware
 const ROOM_TEMP = 22; // °C ambient
 const MAX_HEAT_RATE = 14; // °C/s at peak of S-curve
 const NOISE_AMP = 0.35; // °C peak random noise
+
+// PI-mode parameters – keep in sync with the firmware (main.cpp)
+const PAUSE_TEMP = 275; // low keep-warm hold
+const BAKE_BOOST = 40; // °C added on top of target while baking
+const BAKE_WAIT_MS = 60 * 1000; // 1 min warm-up before baking
+const BAKE_DURATION_MS = 3 * 60 * 1000; // 3 min bake, then back to preheat
 
 /** S-curve heating factor: parabolic 4x(1-x), peaks at x = 0.5. */
 function heatFactor(temp: number, target: number): number {
@@ -33,12 +39,16 @@ type SensorPayload = {
 	temperature: number;
 	relais: number;
 	target_temp: number;
+	pause_temp: number;
+	bake_boost: number;
 	pwm_on: number;
 	pwm_off: number;
 	pid: number;
 	kp: number;
 	ki: number;
 	kd: number;
+	bake_phase: string;
+	bake_remaining: number;
 };
 
 type Command = { cmd: string; value?: number | string };
@@ -50,20 +60,25 @@ export class SpoofSocket {
 	readyState: number = WebSocket.CONNECTING;
 
 	private s: SensorPayload = {
-		mode: 'manual',
+		mode: 'preheat',
 		temperature: ROOM_TEMP,
 		relais: 0,
 		target_temp: 460,
+		pause_temp: PAUSE_TEMP,
+		bake_boost: BAKE_BOOST,
 		pwm_on: 2000,
 		pwm_off: 4000,
 		pid: 0,
 		kp: 0.6,
 		ki: 0.1,
-		kd: 0.0
+		kd: 0.0,
+		bake_phase: '',
+		bake_remaining: 0
 	};
 
 	private integral = 0;
 	private lastSwitch = Date.now();
+	private bakeStart = 0;
 	private ticker: ReturnType<typeof setInterval> | null = null;
 
 	constructor() {
@@ -98,6 +113,30 @@ export class SpoofSocket {
 		this.onclose?.();
 	}
 
+	private isPidMode(m: string): boolean {
+		return m === 'preheat' || m === 'pause' || m === 'baking';
+	}
+
+	/** Effective setpoint the PI loop drives towards for the current mode. */
+	private activeSetpoint(): number {
+		const s = this.s;
+		if (s.mode === 'pause') return s.pause_temp;
+		if (s.mode === 'baking') return s.target_temp + s.bake_boost;
+		return s.target_temp;
+	}
+
+	private applyMode(m: string): void {
+		const s = this.s;
+		s.mode = m;
+		if (m === 'baking') this.bakeStart = Date.now();
+		if (m === 'manual') {
+			s.relais = 0;
+			this.lastSwitch = Date.now();
+		}
+		// Dump windup when the new target is below the current temp (e.g. -> pause)
+		if (this.isPidMode(m) && this.activeSetpoint() < s.temperature) this.integral = 0;
+	}
+
 	private handle(cmd: string, value?: number | string): void {
 		const s = this.s;
 		switch (cmd) {
@@ -105,19 +144,22 @@ export class SpoofSocket {
 				this.emit();
 				break;
 			case 'setTargetTemp':
-				s.target_temp = Number(value);
-				this.integral = 0; // reset integral on setpoint change
+				s.target_temp = Math.max(0, Math.min(600, Number(value)));
+				break;
+			case 'setPauseTemp':
+				s.pause_temp = Math.max(0, Math.min(600, Number(value)));
+				break;
+			case 'setBakeOffset':
+				s.bake_boost = Math.max(0, Math.min(150, Number(value)));
 				break;
 			case 'setMode':
-				s.mode = String(value);
-				if (s.mode === 'manual') s.relais = 0;
-				this.integral = 0;
+				this.applyMode(String(value));
 				break;
 			case 'switchRelais':
-				if (s.mode === 'manual') {
-					s.relais = s.relais ? 0 : 1;
-					this.lastSwitch = Date.now();
-				}
+				// Manual override: take manual control and toggle the relay.
+				s.mode = 'manual';
+				s.relais = s.relais ? 0 : 1;
+				this.lastSwitch = Date.now();
 				break;
 			case 'setPWMOn':
 				s.pwm_on = Number(value) * 1000;
@@ -152,30 +194,45 @@ export class SpoofSocket {
 				s.relais = 1;
 				this.lastSwitch = now;
 			}
-		} else if (s.mode === 'pid') {
-			const error = s.target_temp - s.temperature;
-			this.integral = Math.max(-100, Math.min(100, this.integral + s.ki * error * dt));
-			const output = Math.max(0, Math.min(100, s.kp * error + this.integral));
+		} else if (this.isPidMode(s.mode)) {
+			// Baking = warm-up + bake; when it's all done, return to preheat.
+			if (s.mode === 'baking' && now - this.bakeStart >= BAKE_WAIT_MS + BAKE_DURATION_MS) {
+				this.applyMode('preheat');
+			}
+
+			const error = this.activeSetpoint() - s.temperature;
+			const pTerm = s.kp * error;
+			let output = pTerm + this.integral;
+
+			// Conditional-integration anti-windup (mirrors PIDController::compute)
+			const satHigh = output >= 100 && error > 0;
+			const satLow = output <= 0 && error < 0;
+			if (!satHigh && !satLow) {
+				this.integral = Math.max(-100, Math.min(100, this.integral + s.ki * error * dt));
+			}
+			output = Math.max(0, Math.min(100, pTerm + this.integral));
 			s.pid = output;
 
-			if (output > 0) {
+			if (output >= 100) {
+				s.relais = 1;
+			} else if (output <= 0) {
+				s.relais = 0;
+			} else {
 				const offDelay = s.pwm_on / (output / 100) - s.pwm_on;
 				const elapsed = now - this.lastSwitch;
-				if (s.relais === 1 && offDelay > 0 && elapsed > s.pwm_on) {
+				if (s.relais === 1 && elapsed > s.pwm_on) {
 					s.relais = 0;
 					this.lastSwitch = now;
-				} else if (s.relais === 0 && offDelay > 0 && elapsed > offDelay) {
+				} else if (s.relais === 0 && elapsed > offDelay) {
 					s.relais = 1;
 					this.lastSwitch = now;
 				}
-			} else {
-				s.relais = 0;
 			}
 		}
 
 		// ── thermal model ────────────────────────────────────────────────────
 		if (s.relais) {
-			s.temperature += MAX_HEAT_RATE * heatFactor(s.temperature, s.target_temp) * dt;
+			s.temperature += MAX_HEAT_RATE * heatFactor(s.temperature, this.activeSetpoint()) * dt;
 		} else {
 			s.temperature -= coolingRate(s.temperature) * dt;
 		}
@@ -186,6 +243,23 @@ export class SpoofSocket {
 	}
 
 	private emit(): void {
-		this.onmessage?.({ data: JSON.stringify(this.s) });
+		const s = this.s;
+		if (s.mode === 'baking') {
+			const elapsed = Date.now() - this.bakeStart;
+			if (elapsed < BAKE_WAIT_MS) {
+				s.bake_phase = 'wait';
+				s.bake_remaining = Math.max(0, Math.ceil((BAKE_WAIT_MS - elapsed) / 1000));
+			} else {
+				s.bake_phase = 'bake';
+				s.bake_remaining = Math.max(
+					0,
+					Math.ceil((BAKE_WAIT_MS + BAKE_DURATION_MS - elapsed) / 1000)
+				);
+			}
+		} else {
+			s.bake_phase = '';
+			s.bake_remaining = 0;
+		}
+		this.onmessage?.({ data: JSON.stringify(s) });
 	}
 }

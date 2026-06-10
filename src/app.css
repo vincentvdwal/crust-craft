@@ -15,6 +15,8 @@
 	--green: #22c55e;
 	--red: #ef4444;
 	--radius: 14px;
+	/* Accent colour of the active mode – overwritten from JS, see +page.svelte */
+	--mode-color: #f97316;
 }
 
 [data-theme='light'] {
@@ -52,11 +54,48 @@ p {
 .nav {
 	background: var(--surface);
 	border-bottom: 1px solid var(--border);
+	border-top: 3px solid var(--mode-color);
 	padding: 0.75rem 1rem;
 	display: flex;
 	align-items: center;
 	justify-content: center;
 	position: relative;
+	transition: border-top-color 0.4s;
+}
+
+/* Active-mode pill (left side of the nav) */
+.mode-pill {
+	position: absolute;
+	left: 1rem;
+	top: 50%;
+	transform: translateY(-50%);
+	display: flex;
+	align-items: center;
+	gap: 0.4rem;
+	background: color-mix(in srgb, var(--mode-color) 14%, var(--surface-raised));
+	border: 1px solid color-mix(in srgb, var(--mode-color) 45%, transparent);
+	border-radius: 999px;
+	padding: 0.3rem 0.7rem;
+	font-size: 0.78rem;
+	font-weight: 600;
+	color: var(--text);
+	transition:
+		background 0.4s,
+		border-color 0.4s;
+}
+
+.mode-pill-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--mode-color);
+	box-shadow: 0 0 8px var(--mode-color);
+}
+
+@media (max-width: 540px) {
+	.mode-pill-label {
+		display: none;
+	}
 }
 
 .nav-title {
@@ -163,6 +202,19 @@ p {
 	opacity: 0.8;
 	margin-top: 0.25rem;
 	letter-spacing: 0.02em;
+}
+
+/* Active-setpoint override shown in Pause / Baking */
+.target-old {
+	text-decoration: line-through;
+	color: var(--text-muted);
+	font-weight: 500;
+	margin-right: 0.4rem;
+}
+
+.target-new {
+	color: var(--mode-color);
+	font-weight: 700;
 }
 
 @keyframes extreme-blink {
@@ -291,12 +343,12 @@ p {
 @property --ovenColor1 {
 	syntax: '<color>';
 	initial-value: rgba(255, 0, 0, 0);
-	inherits: false;
+	inherits: true;
 }
 @property --ovenColor2 {
 	syntax: '<color>';
 	initial-value: rgba(255, 0, 0, 0);
-	inherits: false;
+	inherits: true;
 }
 
 .oven {
@@ -305,12 +357,8 @@ p {
 }
 
 .oven-wrapper {
-	background: radial-gradient(
-		circle at center,
-		var(--ovenColor1) 0%,
-		var(--ovenColor2) 30%,
-		transparent 68%
-	);
+	position: relative;
+	isolation: isolate;
 	width: 60%;
 	max-width: 480px;
 	display: flex;
@@ -322,9 +370,41 @@ p {
 		--ovenColor2 2.5s;
 }
 
+/* Soft glow behind the oven – an oval rotated to follow the appliance's shape. */
+.oven-wrapper::before {
+	content: '';
+	position: absolute;
+	inset: -22% -12%;
+	z-index: -1;
+	background: radial-gradient(
+		ellipse 58% 42% at 50% 54%,
+		var(--ovenColor1) 0%,
+		var(--ovenColor2) 38%,
+		transparent 72%
+	);
+	transform: rotate(-8deg);
+	transition: inset 2.2s ease;
+}
+
+/* Glow colours per heating mode (only while the relay is firing) */
 .oven.on .oven-wrapper {
-	--ovenColor1: rgba(255, 110, 0, 0.85);
-	--ovenColor2: rgba(255, 60, 0, 0.4);
+	--ovenColor1: rgba(255, 120, 0, 0.85);
+	--ovenColor2: rgba(255, 70, 0, 0.4);
+}
+
+[data-mode='baking'] .oven.on .oven-wrapper {
+	--ovenColor1: rgba(225, 30, 30, 0.95);
+	--ovenColor2: rgba(150, 0, 0, 0.5);
+}
+
+[data-mode='pause'] .oven.on .oven-wrapper {
+	--ovenColor1: rgba(255, 178, 40, 0.78);
+	--ovenColor2: rgba(245, 140, 10, 0.34);
+}
+
+/* Baking pushes the glow further outwards for a hotter look */
+[data-mode='baking'] .oven-wrapper::before {
+	inset: -45% -25%;
 }
 
 .oven-img-wrapper {
@@ -397,21 +477,49 @@ p {
 	color: var(--text-muted);
 }
 
-.mode-select {
-	background: var(--surface-raised);
-	border: 1px solid var(--border);
-	border-radius: 8px;
-	color: var(--text);
-	font-size: 0.95rem;
-	padding: 0.4rem 0.6rem;
+/* ── Mode buttons ──────────────────────────────────────── */
+.mode-btn-grid {
+	display: grid;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 0.5rem;
 	width: 100%;
-	outline: none;
-	cursor: pointer;
-	transition: border-color 0.15s;
 }
 
-.mode-select:focus {
-	border-color: var(--accent);
+.mode-btn {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 0.2rem;
+	background: var(--surface-raised);
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	color: var(--text-muted);
+	padding: 0.5rem 0.25rem;
+	cursor: pointer;
+	font-size: 0.72rem;
+	font-weight: 600;
+	transition:
+		background 0.15s,
+		border-color 0.15s,
+		color 0.15s,
+		box-shadow 0.15s;
+}
+
+.mode-btn-icon {
+	font-size: 1.1rem;
+	line-height: 1;
+}
+
+.mode-btn:hover {
+	color: var(--text);
+	border-color: var(--mc);
+}
+
+.mode-btn.active {
+	color: #fff;
+	background: var(--mc);
+	border-color: var(--mc);
+	box-shadow: 0 0 14px color-mix(in srgb, var(--mc) 55%, transparent);
 }
 
 /* ── Sub-controls (PWM / PID params) ───────────────────── */
@@ -465,6 +573,92 @@ p {
 	background: var(--accent-dim);
 	border-color: var(--accent);
 	color: var(--accent);
+}
+
+/* ── Bake countdown banner ─────────────────────────────── */
+.bake-banner {
+	background: linear-gradient(
+		135deg,
+		color-mix(in srgb, var(--red) 22%, var(--surface)),
+		var(--surface)
+	);
+	border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
+	border-radius: var(--radius);
+	padding: 1rem 1.25rem 1.1rem;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 0.25rem;
+	box-shadow: 0 0 24px color-mix(in srgb, var(--red) 30%, transparent);
+	animation: bake-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes bake-pulse {
+	0%,
+	100% {
+		box-shadow: 0 0 18px color-mix(in srgb, var(--red) 22%, transparent);
+	}
+	50% {
+		box-shadow: 0 0 34px color-mix(in srgb, var(--red) 45%, transparent);
+	}
+}
+
+/* Warm-up phase – amber instead of red, gentler pulse */
+.bake-banner-wait {
+	background: linear-gradient(
+		135deg,
+		color-mix(in srgb, #eab308 20%, var(--surface)),
+		var(--surface)
+	);
+	border-color: color-mix(in srgb, #eab308 48%, transparent);
+	animation: warm-pulse 1.9s ease-in-out infinite;
+}
+
+.bake-banner-wait .bake-banner-head {
+	color: #eab308;
+}
+
+@keyframes warm-pulse {
+	0%,
+	100% {
+		box-shadow: 0 0 16px color-mix(in srgb, #eab308 20%, transparent);
+	}
+	50% {
+		box-shadow: 0 0 32px color-mix(in srgb, #eab308 45%, transparent);
+	}
+}
+
+.bake-banner-head {
+	display: flex;
+	align-items: center;
+	gap: 0.45rem;
+	font-size: 0.8rem;
+	font-weight: 700;
+	letter-spacing: 0.06em;
+	color: var(--red);
+}
+
+.bake-banner-icon {
+	font-size: 1.05rem;
+}
+
+.bake-timer {
+	font-size: 3.2rem;
+	font-weight: 800;
+	line-height: 1.05;
+	color: var(--text);
+	font-variant-numeric: tabular-nums;
+}
+
+.bake-banner-sub {
+	font-size: 0.75rem;
+	color: var(--text-muted);
+}
+
+/* ── Whole-UI mode accent ──────────────────────────────── */
+/* Tint the status/control cards with the active mode colour. */
+.card-value {
+	transition: color 0.3s;
 }
 
 /* ── Utility ───────────────────────────────────────────── */

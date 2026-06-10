@@ -47,21 +47,24 @@ double PIDController::compute(double current_temp)
     // Proportional
     double p_term = kp * error;
 
-    // Integral + anti-windup
-    integral += ki * error * dt;
-    integral = clamp(integral, -integral_max, integral_max);
+    // Tentative output using the integral as it currently stands.
+    double output = p_term + integral;
 
-    // // Derivative
-    // double d_term = 0.0;
-    // if (!first_run)
-    // {
-    //     d_term = kd * (error - prev_error) / dt;
-    // }
-    // first_run = false;
+    // Integral with conditional-integration anti-windup.
+    // Only accumulate when we are NOT already saturated in the direction the
+    // error would push us further. During a long heat-up the output sits at
+    // 100% for minutes; without this guard the integral winds up enormously
+    // and causes a large overshoot when the setpoint is finally reached.
+    bool saturated_high = output >= max_output && error > 0.0;
+    bool saturated_low = output <= min_output && error < 0.0;
+    if (!saturated_high && !saturated_low)
+    {
+        integral += ki * error * dt;
+        integral = clamp(integral, -integral_max, integral_max);
+    }
 
     // Output
-    double output = p_term + integral; // + d_term;
-    output = clamp(output, min_output, max_output);
+    output = clamp(p_term + integral, min_output, max_output);
 
     prev_error = error;
     return output;

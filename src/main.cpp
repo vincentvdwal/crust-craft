@@ -27,7 +27,7 @@ unsigned long lastWebSocket = 0;
 const unsigned long WS_INTERVAL = 500;
 
 float temperature = 0;
-float targetTemp = 460;
+float targetTemp = 370.0f; // default target temp for preheating, adjustable via UI
 
 unsigned long lastSwitch = 0;
 float pwmSwitchDelayOn = 2000;  // 2s
@@ -35,8 +35,8 @@ float pwmSwitchDelayOff = 4000; // 4s
 
 float power = 100;
 
-float kp = 0.6;
-float ki = 0.1;
+float kp = 0.55;
+float ki = 0.005;
 float kd = 0.0;
 
 // Heating modes. PREHEAT, PAUSE and BAKING are all PI-regulated and only
@@ -402,11 +402,12 @@ void setup()
 {
   Serial.begin(9600);
   pinMode(relay, OUTPUT);
-  digitalWrite(relay, LOW); // boot with heating OFF; the PI loop drives the relay
 
   initWiFi();
   initLittleFS();
   initWebSocket();
+
+  digitalWrite(relay, LOW); // boot with heating OFF; the PI loop drives the relay
 
   // Web Server Root URL
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)

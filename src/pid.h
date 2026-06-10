@@ -4,7 +4,7 @@
 class PIDController
 {
 private:
-    double kp, ki, kd, setpoint, integral, prev_error;
+    double kp, ki, kd, setpoint, integral, prev_measurement, d_filtered;
     double max_output, min_output, integral_max, dt;
     bool first_run;
 

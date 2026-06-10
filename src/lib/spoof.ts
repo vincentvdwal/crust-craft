@@ -17,10 +17,11 @@ const MAX_HEAT_RATE = 14; // °C/s at peak of S-curve
 const NOISE_AMP = 0.35; // °C peak random noise
 
 // PI-mode parameters – keep in sync with the firmware (main.cpp)
-const PAUSE_TEMP = 275; // low keep-warm hold
+const PAUSE_TEMP = 250; // low keep-warm hold
 const BAKE_BOOST = 40; // °C added on top of target while baking
 const BAKE_WAIT_MS = 60 * 1000; // 1 min warm-up before baking
 const BAKE_DURATION_MS = 3 * 60 * 1000; // 3 min bake, then back to preheat
+const D_FILTER = 0.8; // derivative low-pass smoothing (matches firmware)
 
 /** S-curve heating factor: parabolic 4x(1-x), peaks at x = 0.5. */
 function heatFactor(temp: number, target: number): number {
@@ -63,20 +64,23 @@ export class SpoofSocket {
 		mode: 'preheat',
 		temperature: ROOM_TEMP,
 		relais: 0,
-		target_temp: 460,
+		target_temp: 350,
 		pause_temp: PAUSE_TEMP,
 		bake_boost: BAKE_BOOST,
 		pwm_on: 2000,
 		pwm_off: 4000,
 		pid: 0,
-		kp: 0.6,
-		ki: 0.03,
+		kp: 0.55,
+		ki: 0.005,
 		kd: 0.0,
 		bake_phase: '',
 		bake_remaining: 0
 	};
 
 	private integral = 0;
+	private dFilt = 0;
+	private prevTemp = ROOM_TEMP;
+	private firstRun = true;
 	private lastSwitch = Date.now();
 	private bakeStart = 0;
 	private ticker: ReturnType<typeof setInterval> | null = null;
@@ -136,7 +140,11 @@ export class SpoofSocket {
 		}
 		// Reset integral arriving from a non-PID mode (stale value) or when the
 		// new target is below the current temp (mirrors firmware applyMode).
-		if (this.isPidMode(m) && (!wasPid || this.activeSetpoint() < s.temperature)) this.integral = 0;
+		if (this.isPidMode(m) && (!wasPid || this.activeSetpoint() < s.temperature)) {
+			this.integral = 0;
+			this.dFilt = 0;
+			this.firstRun = true;
+		}
 	}
 
 	private handle(cmd: string, value?: number | string): void {
@@ -213,7 +221,18 @@ export class SpoofSocket {
 				// integral clamped to ±70 to match the firmware (anti-overshoot)
 				this.integral = Math.max(-70, Math.min(70, this.integral + s.ki * error * dt));
 			}
-			output = Math.max(0, Math.min(100, pTerm + this.integral));
+
+			// Filtered derivative on measurement (mirrors PIDController::compute)
+			let dTerm = 0;
+			if (!this.firstRun) {
+				const deriv = (-s.kd * (s.temperature - this.prevTemp)) / dt;
+				this.dFilt = D_FILTER * this.dFilt + (1 - D_FILTER) * deriv;
+				dTerm = this.dFilt;
+			}
+			this.firstRun = false;
+			this.prevTemp = s.temperature;
+
+			output = Math.max(0, Math.min(100, pTerm + this.integral + dTerm));
 			s.pid = output;
 
 			if (output >= 100) {

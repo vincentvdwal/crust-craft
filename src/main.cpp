@@ -35,9 +35,9 @@ float pwmSwitchDelayOff = 4000; // 4s
 
 float power = 100;
 
-float kp = 0.6;
-float ki = 0.03;
-float kd = 0.0;
+float kp = 0.55;
+float ki = 0.005;
+float kd = 0.5;
 
 // Heating modes. PREHEAT, PAUSE and BAKING are all PI-regulated and only
 // differ in the setpoint they drive towards. The oven always boots in PREHEAT
@@ -46,7 +46,7 @@ enum class Mode { MANUAL, PWM, PREHEAT, PAUSE, BAKING };
 Mode mode = Mode::PREHEAT;
 
 // Setpoints / timing for the PI-based modes (pauseTemp / bakeBoost are UI-adjustable)
-float pauseTemp = 275.0f;                                   // low "keep-warm" hold
+float pauseTemp = 250.0f;                                   // low "keep-warm" hold
 float bakeBoost = 40.0f;                                    // °C added on top of target
 constexpr unsigned long BAKE_WAIT_MS = 60UL * 1000;         // 1 min warm-up before baking
 constexpr unsigned long BAKE_DURATION_MS = 3UL * 60 * 1000; // 3 min bake, then -> PREHEAT

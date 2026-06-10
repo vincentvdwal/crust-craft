@@ -27,9 +27,19 @@
 		Tooltip
 	);
 
-	// Rolling window for the chart (~5 min at 2 pts/sec)
-	const CHART_WINDOW = 600;
-	// Full buffer kept for CSV export (24h at 2 pts/sec)
+	// Chart view ranges (minutes); 'all' = the whole stored history.
+	const POINTS_PER_MIN = 120; // 2 readings/sec × 60
+	const MAX_RENDER_POINTS = 1500; // points actually drawn; longer ranges get downsampled
+	const RANGES = [
+		{ label: '5m', value: 5 },
+		{ label: '10m', value: 10 },
+		{ label: '20m', value: 20 },
+		{ label: '30m', value: 30 },
+		{ label: '60m', value: 60 },
+		{ label: 'All', value: 'all' }
+	] as const;
+	type RangeValue = (typeof RANGES)[number]['value'];
+	// Full buffer kept for CSV export + as the chart source (24h at 2 pts/sec)
 	const MAX_STORED = 24 * 2 * 60 * 60;
 
 	let gateway = `ws://${page.url.host}/ws`;
@@ -38,21 +48,23 @@
 	let mode = $state('preheat');
 	let temp = $state(0);
 	let relais = $state(0);
-	let targetTemp = $state(460);
+	let targetTemp = $state(350);
 	let calculatedPidOutput = $state(0);
 	let bakeRemaining = $state(0);
 	let bakePhase = $state('');
-	let pauseTemp = $state(275);
+	let pauseTemp = $state(250);
 	let bakeBoost = $state(40);
 
 	let pwmOn = $state(2);
 	let pwmOff = $state(4);
 
-	let kp = $state(0.6);
-	let ki = $state(0.03);
+	let kp = $state(0.55);
+	let ki = $state(0.005);
+	let kd = $state(0.0);
 
 	let pauseGraphUpdate = $state(false);
 	let darkMode = $state(true);
+	let chartRange = $state<RangeValue>(5);
 
 	// ── Modes ──────────────────────────────────────────────
 	// Preheat / Pause / Baking are all PI-regulated on the firmware; they only
@@ -182,10 +194,11 @@
 		}
 	};
 
-	// Full history – only used for CSV export
+	// Full history – source for both the chart and the CSV export
 	let temperatureData: Array<[number, number]> = [];
 	let relaisData: Array<[number, number]> = [];
 	let powerData: Array<[number, number]> = [];
+	let targetData: Array<[number, number]> = [];
 
 	let canvas: HTMLCanvasElement;
 	let downloadCSVButton: HTMLAnchorElement;
@@ -196,6 +209,84 @@
 		if (ws?.readyState === WebSocket.OPEN) {
 			ws.send(JSON.stringify(value !== undefined ? { cmd, value } : { cmd }));
 		}
+	};
+
+	const pushCapped = (arr: Array<[number, number]>, t: number, v: number) => {
+		if (arr.length >= MAX_STORED) arr.shift();
+		arr.push([t, v]);
+	};
+
+	type Pt = { x: number; y: number };
+
+	// Build a chart series from the raw history slice src[start..], downsampling
+	// to at most `maxPoints` by keeping each bucket's min AND max so peaks (e.g.
+	// overshoot spikes) are never hidden. Reads the source directly so only the
+	// (small) output is allocated, even for the "All" range.
+	const buildSeries = (src: Array<[number, number]>, start: number, maxPoints: number): Pt[] => {
+		const count = src.length - start;
+		if (count <= 0) return [];
+		if (count <= maxPoints) {
+			const out: Pt[] = new Array(count);
+			for (let i = 0; i < count; i++) out[i] = { x: src[start + i][0], y: src[start + i][1] };
+			return out;
+		}
+		const buckets = Math.max(1, Math.floor(maxPoints / 2));
+		const size = count / buckets;
+		const out: Pt[] = [];
+		for (let b = 0; b < buckets; b++) {
+			const s = start + Math.floor(b * size);
+			const e = start + Math.min(count, Math.floor((b + 1) * size));
+			let mnI = s;
+			let mxI = s;
+			for (let i = s + 1; i < e; i++) {
+				if (src[i][1] < src[mnI][1]) mnI = i;
+				if (src[i][1] > src[mxI][1]) mxI = i;
+			}
+			const a = Math.min(mnI, mxI); // emit in time order
+			const z = Math.max(mnI, mxI);
+			out.push({ x: src[a][0], y: src[a][1] });
+			if (z !== a) out.push({ x: src[z][0], y: src[z][1] });
+		}
+		return out;
+	};
+
+	// Rebuild the chart datasets from the stored history for the selected range,
+	// then zoom the y-axis to the visible temperature so small oscillations are
+	// readable.
+	const refreshChart = () => {
+		if (!chart) return;
+		const total = temperatureData.length;
+		const count = chartRange === 'all' ? total : Math.min(total, chartRange * POINTS_PER_MIN);
+		const start = total - count;
+
+		chart.data.datasets[0].data = buildSeries(temperatureData, start, MAX_RENDER_POINTS);
+		chart.data.datasets[1].data = buildSeries(targetData, start, MAX_RENDER_POINTS);
+		chart.data.datasets[2].data = buildSeries(relaisData, start, MAX_RENDER_POINTS);
+
+		// Zoom y tight around the temperature actually on screen (+ a little pad).
+		let lo = Infinity;
+		let hi = -Infinity;
+		for (const p of chart.data.datasets[0].data as Pt[]) {
+			if (p.y < lo) lo = p.y;
+			if (p.y > hi) hi = p.y;
+		}
+		const yScale = chart.options.scales!.y as { min?: number; max?: number };
+		if (lo === Infinity) {
+			yScale.min = 0;
+			yScale.max = undefined;
+		} else {
+			const span = Math.max(hi - lo, 8); // never zoom tighter than ~8°C
+			const pad = span * 0.15;
+			yScale.min = Math.max(0, Math.floor(lo - pad));
+			yScale.max = Math.ceil(hi + pad);
+		}
+
+		chart.update('none');
+	};
+
+	const setRange = (v: RangeValue) => {
+		chartRange = v;
+		refreshChart();
 	};
 
 	onMount(() => {
@@ -216,13 +307,19 @@
 						type: 'time',
 						time: {
 							tooltipFormat: 'HH:mm:ss',
-							displayFormats: { minute: 'HH:mm', hour: 'HH:mm' }
+							// 24-hour formats for every unit so no am/pm leaks in
+							displayFormats: {
+								millisecond: 'HH:mm:ss',
+								second: 'HH:mm:ss',
+								minute: 'HH:mm',
+								hour: 'HH:mm'
+							}
 						},
 						ticks: { color: '#7a7f96' },
 						grid: { color: 'rgba(255,255,255,0.05)' }
 					},
 					y: {
-						min: 0,
+						// min/max are set dynamically in refreshChart() to zoom on the data
 						ticks: { color: '#7a7f96' },
 						grid: { color: 'rgba(255,255,255,0.05)' }
 					},
@@ -323,6 +420,7 @@
 		calculatedPidOutput = data.pid;
 		kp = data.kp;
 		ki = data.ki;
+		kd = data.kd ?? 0;
 		bakeRemaining = data.bake_remaining ?? 0;
 		bakePhase = data.bake_phase ?? '';
 		pauseTemp = data.pause_temp ?? pauseTemp;
@@ -330,30 +428,20 @@
 
 		const now = Date.now();
 
-		if (temperatureData.length >= MAX_STORED) temperatureData.shift();
-		temperatureData.push([now, temp]);
-		if (relaisData.length >= MAX_STORED) relaisData.shift();
-		relaisData.push([now, relais]);
-		if (powerData.length >= MAX_STORED) powerData.shift();
-		powerData.push([now, calculatedPidOutput]);
+		// Effective setpoint the oven is actually driving towards (boost / pause).
+		const effTarget =
+			data.mode === 'baking'
+				? data.target_temp + (data.bake_boost ?? bakeBoost)
+				: data.mode === 'pause'
+					? (data.pause_temp ?? pauseTemp)
+					: data.target_temp;
 
-		if (!pauseGraphUpdate && chart) {
-			const tempSeries = chart.data.datasets[0].data as { x: number; y: number }[];
-			const targetSeries = chart.data.datasets[1].data as { x: number; y: number }[];
-			const relaySeries = chart.data.datasets[2].data as { x: number; y: number }[];
+		pushCapped(temperatureData, now, temp);
+		pushCapped(relaisData, now, data.relais);
+		pushCapped(powerData, now, calculatedPidOutput);
+		pushCapped(targetData, now, effTarget);
 
-			tempSeries.push({ x: now, y: temp });
-			targetSeries.push({ x: now, y: targetTemp });
-			relaySeries.push({ x: now, y: data.relais });
-
-			if (tempSeries.length > CHART_WINDOW) {
-				tempSeries.shift();
-				targetSeries.shift();
-				relaySeries.shift();
-			}
-
-			chart.update('none');
-		}
+		if (!pauseGraphUpdate) refreshChart();
 	};
 
 	const switchRelais = () => send('switchRelais');
@@ -510,7 +598,19 @@
 
 	<!-- Chart -->
 	<div class="chart-section">
-		<canvas bind:this={canvas} id="crusty"></canvas>
+		<div class="chart-toolbar">
+			{#each RANGES as r (r.value)}
+				<button
+					class="range-btn {chartRange === r.value ? 'active' : ''}"
+					onclick={() => setRange(r.value)}
+				>
+					{r.label}
+				</button>
+			{/each}
+		</div>
+		<div class="chart-canvas-wrap">
+			<canvas bind:this={canvas} id="crusty"></canvas>
+		</div>
 	</div>
 
 	<!-- Controls -->
@@ -631,11 +731,11 @@
 				<p class="subinfo mt-3">
 					ON {pwmOn.toFixed(2)} s &nbsp;/&nbsp; OFF {pwmOff ? pwmOff.toFixed(2) : 0} s
 				</p>
-				<div class="subcontrol-grid mt-3">
+				<div class="k-grid mt-3">
 					<div class="subcontrol">
 						<label class="sublabel" for="kp">Kp</label>
 						<input
-							class="num-input"
+							class="num-input k-input"
 							type="number"
 							min="0"
 							max="50"
@@ -648,14 +748,27 @@
 					<div class="subcontrol">
 						<label class="sublabel" for="ki">Ki</label>
 						<input
-							class="num-input"
+							class="num-input k-input"
 							type="number"
 							min="0"
 							max="50"
-							step="0.1"
+							step="0.0001"
 							value={ki}
 							id="ki"
 							onchange={(e) => changeKValue(e, 'i')}
+						/>
+					</div>
+					<div class="subcontrol">
+						<label class="sublabel" for="kd">Kd</label>
+						<input
+							class="num-input k-input"
+							type="number"
+							min="0"
+							max="50"
+							step="0.0001"
+							value={kd}
+							id="kd"
+							onchange={(e) => changeKValue(e, 'd')}
 						/>
 					</div>
 				</div>
